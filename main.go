@@ -45,7 +45,7 @@ func main() {
 	// Parse command line flags
 	var (
 		configPath  = flag.String("config", "", "Path to configuration file")
-		daemon      = flag.Bool("daemon", false, "Run as a daemon")
+		runDaemon   = flag.Bool("daemon", false, "Run as a daemon")
 		once        = flag.Bool("once", false, "Run cleanup once and exit")
 		level       = flag.String("level", "", "Force cleanup level")
 		dryRun      = flag.Bool("dry-run", false, "Show what would be cleaned")
@@ -131,7 +131,7 @@ func main() {
 	}
 
 	// Run once or as daemon
-	if *once || !*daemon {
+	if *once || !*runDaemon {
 		if err := d.runOnce(ctx, monitor.LevelNone); err != nil {
 			logger.Error("cleanup failed", "error", err)
 			os.Exit(1)

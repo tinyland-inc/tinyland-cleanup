@@ -60,8 +60,8 @@ type EnableFlags struct {
 	Lima bool `yaml:"lima"`
 	// Homebrew for brew cleanup (Darwin)
 	Homebrew bool `yaml:"homebrew"`
-	// iOSSimulator for iOS Simulator cleanup (Darwin)
-	iOSSimulator bool `yaml:"ios_simulator"`
+	// IOSSimulator for iOS Simulator cleanup (Darwin)
+	IOSSimulator bool `yaml:"ios_simulator"`
 	// GitLabRunner for GitLab CI cache cleanup
 	GitLabRunner bool `yaml:"gitlab_runner"`
 }
@@ -111,7 +111,7 @@ func DefaultConfig() *Config {
 			Docker:       true,
 			Lima:         runtime.GOOS == "darwin",
 			Homebrew:     runtime.GOOS == "darwin",
-			iOSSimulator: runtime.GOOS == "darwin",
+			IOSSimulator: runtime.GOOS == "darwin",
 			GitLabRunner: true,
 		},
 		Docker: DockerConfig{

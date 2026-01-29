@@ -148,7 +148,7 @@ func (p *IOSSimulatorPlugin) SupportedPlatforms() []string {
 
 // Enabled checks if iOS Simulator cleanup is enabled.
 func (p *IOSSimulatorPlugin) Enabled(cfg *config.Config) bool {
-	return cfg.Enable.iOSSimulator
+	return cfg.Enable.IOSSimulator
 }
 
 // Cleanup performs iOS Simulator cleanup at the specified level.
@@ -277,7 +277,7 @@ func (p *XcodePlugin) SupportedPlatforms() []string {
 
 // Enabled checks if Xcode cleanup is enabled (uses iOS Simulator flag).
 func (p *XcodePlugin) Enabled(cfg *config.Config) bool {
-	return cfg.Enable.iOSSimulator // Bundled with iOS Simulator cleanup
+	return cfg.Enable.IOSSimulator // Bundled with iOS Simulator cleanup
 }
 
 // Cleanup performs Xcode cleanup at the specified level.

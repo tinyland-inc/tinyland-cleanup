@@ -48,8 +48,8 @@ func TestDefaultConfig(t *testing.T) {
 		if !cfg.Enable.Homebrew {
 			t.Error("expected Homebrew enabled on Darwin")
 		}
-		if !cfg.Enable.iOSSimulator {
-			t.Error("expected iOSSimulator enabled on Darwin")
+		if !cfg.Enable.IOSSimulator {
+			t.Error("expected IOSSimulator enabled on Darwin")
 		}
 	}
 }
