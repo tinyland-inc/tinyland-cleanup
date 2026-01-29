@@ -1,0 +1,102 @@
+# =============================================================================
+# BUILD.bazel - tinyland-cleanup Go application
+# =============================================================================
+# Cross-platform disk cleanup daemon with graduated thresholds.
+#
+# Usage:
+#   bazel build //cmd/tinyland-cleanup:tinyland-cleanup
+#   bazel run //cmd/tinyland-cleanup:tinyland-cleanup -- --help
+#   bazel test //cmd/tinyland-cleanup/...
+# =============================================================================
+
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+# =============================================================================
+# Main Binary
+# =============================================================================
+
+go_binary(
+    name = "tinyland-cleanup",
+    srcs = ["main.go"],
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.version": "{STABLE_VERSION}",
+        "main.commit": "{STABLE_GIT_COMMIT}",
+        "main.date": "{BUILD_TIMESTAMP}",
+    },
+    deps = [
+        ":config",
+        ":monitor",
+        ":plugins",
+    ],
+)
+
+# =============================================================================
+# Libraries
+# =============================================================================
+
+go_library(
+    name = "config",
+    srcs = ["config/config.go"],
+    importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/config",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)
+
+go_library(
+    name = "plugins",
+    srcs = ["plugins/plugin.go"],
+    importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/plugins",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":config",
+    ],
+)
+
+go_library(
+    name = "monitor",
+    srcs = ["monitor/disk.go"],
+    importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/monitor",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_shirou_gopsutil_v3//disk",
+    ],
+)
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+go_test(
+    name = "config_test",
+    srcs = ["config/config_test.go"],
+    embed = [":config"],
+)
+
+go_test(
+    name = "plugins_test",
+    srcs = ["plugins/plugin_test.go"],
+    embed = [":plugins"],
+    deps = [":config"],
+)
+
+go_test(
+    name = "monitor_test",
+    srcs = ["monitor/disk_test.go"],
+    embed = [":monitor"],
+)
+
+# =============================================================================
+# Test Suite
+# =============================================================================
+
+test_suite(
+    name = "all_tests",
+    tests = [
+        ":config_test",
+        ":monitor_test",
+        ":plugins_test",
+    ],
+)

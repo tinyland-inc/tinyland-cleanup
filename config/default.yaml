@@ -1,0 +1,49 @@
+# tinyland-cleanup default configuration
+# Copy to ~/.config/tinyland-cleanup/config.yaml and customize
+
+# Polling interval in seconds
+# CRITICAL: For CI runners with limited disk, use 30-60 seconds
+poll_interval: 60
+
+# Disk usage thresholds (percentage)
+thresholds:
+  warning: 80      # Level 1: Clear caches
+  moderate: 85     # Level 2: Prune container images
+  aggressive: 90   # Level 3: Prune volumes
+  critical: 95     # Level 4: Emergency cleanup
+
+# Target free space percentage after cleanup
+target_free: 70
+
+# Enable/disable specific cleanup plugins
+enable:
+  cache: true           # pip, npm, go, cargo caches
+  nix_gc: true          # nix-collect-garbage
+  docker: true          # Docker image/volume/builder cleanup
+  lima: true            # Lima VM cleanup (Darwin only)
+  homebrew: true        # Homebrew cleanup (Darwin only)
+  ios_simulator: true   # iOS Simulator cleanup (Darwin only)
+  gitlab_runner: true   # GitLab runner cache cleanup
+
+# Docker-specific settings
+docker:
+  # Socket path (auto-detected if not specified)
+  # socket: /var/run/docker.sock  # Linux
+  # socket: ~/.colima/default/docker.sock  # macOS Colima
+
+  # Prune images older than this duration
+  prune_images_age: "24h"
+
+  # Don't prune images used by running containers
+  protect_running_containers: true
+
+# Lima VM settings (macOS)
+lima:
+  vm_names:
+    - colima
+    - unified
+
+# Notification settings
+notify:
+  enabled: false
+  # webhook_url: "https://hooks.slack.com/services/..."
