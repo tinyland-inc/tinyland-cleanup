@@ -7,6 +7,10 @@
 #   bazel build //cmd/tinyland-cleanup:tinyland-cleanup
 #   bazel run //cmd/tinyland-cleanup:tinyland-cleanup -- --help
 #   bazel test //cmd/tinyland-cleanup/...
+#
+# Platform-specific builds:
+#   bazel build --config=linux //cmd/tinyland-cleanup:tinyland-cleanup
+#   bazel build --config=macos //cmd/tinyland-cleanup:tinyland-cleanup
 # =============================================================================
 
 load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
@@ -17,7 +21,10 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_binary(
     name = "tinyland-cleanup",
-    srcs = ["main.go"],
+    srcs = ["main.go"] + select({
+        "@platforms//os:macos": ["plugins_darwin.go"],
+        "//conditions:default": ["plugins_other.go"],
+    }),
     visibility = ["//visibility:public"],
     x_defs = {
         "main.version": "{STABLE_VERSION}",
@@ -47,7 +54,15 @@ go_library(
 
 go_library(
     name = "plugins",
-    srcs = ["plugins/plugin.go"],
+    srcs = [
+        "plugins/cache.go",
+        "plugins/docker.go",
+        "plugins/nix.go",
+        "plugins/plugin.go",
+    ] + select({
+        "@platforms//os:macos": ["plugins/darwin.go"],
+        "//conditions:default": [],
+    }),
     importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/plugins",
     visibility = ["//visibility:public"],
     deps = [
@@ -73,6 +88,7 @@ go_test(
     name = "config_test",
     srcs = ["config/config_test.go"],
     embed = [":config"],
+    timeout = "short",
 )
 
 go_test(
@@ -80,20 +96,43 @@ go_test(
     srcs = ["plugins/plugin_test.go"],
     embed = [":plugins"],
     deps = [":config"],
+    timeout = "short",
 )
 
 go_test(
     name = "monitor_test",
     srcs = ["monitor/disk_test.go"],
     embed = [":monitor"],
+    timeout = "short",
 )
 
 # =============================================================================
-# Test Suite
+# Test Suites
 # =============================================================================
 
+# All platform-agnostic tests (safe to run on any CI runner)
 test_suite(
     name = "all_tests",
+    tests = [
+        ":config_test",
+        ":monitor_test",
+        ":plugins_test",
+    ],
+)
+
+# Linux-specific test suite
+test_suite(
+    name = "linux_tests",
+    tests = [
+        ":config_test",
+        ":monitor_test",
+        ":plugins_test",
+    ],
+)
+
+# Darwin test suite (includes Darwin-specific tests when available)
+test_suite(
+    name = "darwin_tests",
     tests = [
         ":config_test",
         ":monitor_test",
