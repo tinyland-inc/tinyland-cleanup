@@ -57,8 +57,11 @@ go_library(
     srcs = [
         "plugins/cache.go",
         "plugins/docker.go",
+        "plugins/etcd.go",
+        "plugins/gitlab_runner.go",
         "plugins/nix.go",
         "plugins/plugin.go",
+        "plugins/rke2.go",
     ] + select({
         "@platforms//os:macos": ["plugins/darwin.go"],
         "//conditions:default": [],

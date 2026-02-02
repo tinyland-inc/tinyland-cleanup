@@ -23,6 +23,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -59,16 +60,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Setup logging
-	logLevel := slog.LevelInfo
-	if *verbose {
-		logLevel = slog.LevelDebug
-	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
-
-	// Load configuration
+	// Load configuration first to get log file path
 	if *configPath == "" {
 		home, _ := os.UserHomeDir()
 		*configPath = filepath.Join(home, ".config", "tinyland-cleanup", "config.yaml")
@@ -76,15 +68,36 @@ func main() {
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		logger.Error("failed to load config", "error", err)
+		// Fall back to stderr logging if config fails
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Setup log file
+	// Setup log file directory
 	if err := ensureLogDir(cfg.LogFile); err != nil {
-		logger.Error("failed to create log directory", "error", err)
+		fmt.Fprintf(os.Stderr, "failed to create log directory: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Setup logging - write to both stderr and log file
+	logLevel := slog.LevelInfo
+	if *verbose {
+		logLevel = slog.LevelDebug
+	}
+
+	// Open log file for writing
+	logFile, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open log file: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+
+	// Create multi-writer for both stderr and log file
+	multiWriter := io.MultiWriter(os.Stderr, logFile)
+	logger := slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
 
 	// Create plugin registry and register all plugins
 	registry := plugins.NewRegistry()
@@ -184,8 +197,15 @@ func (d *daemon) run(ctx context.Context) error {
 }
 
 func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) error {
-	// Check disk usage
-	stats, detectedLevel, err := d.monitor.Check("/")
+	// Check disk usage - use home directory to get correct volume on macOS APFS
+	// On macOS, "/" is the sealed system volume, but user data is on /System/Volumes/Data
+	// Using $HOME ensures we monitor the volume where data actually lives
+	monitorPath := "/"
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		monitorPath = home
+	}
+
+	stats, detectedLevel, err := d.monitor.Check(monitorPath)
 	if err != nil {
 		return fmt.Errorf("failed to check disk: %w", err)
 	}
@@ -250,6 +270,11 @@ func registerPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewDockerPlugin())
 	registry.Register(plugins.NewNixPlugin())
 	registry.Register(plugins.NewCachePlugin())
+	registry.Register(plugins.NewGitLabRunnerPlugin())
+
+	// Kubernetes plugins (disabled by default, for future use)
+	registry.Register(plugins.NewEtcdPlugin())
+	registry.Register(plugins.NewRKE2Plugin())
 
 	// Darwin-specific plugins (registered on all platforms but platform-checked)
 	registerDarwinPlugins(registry)
