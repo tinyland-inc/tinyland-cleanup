@@ -61,6 +61,7 @@ go_library(
         "plugins/gitlab_runner.go",
         "plugins/nix.go",
         "plugins/plugin.go",
+        "plugins/podman.go",
         "plugins/rke2.go",
     ] + select({
         "@platforms//os:macos": ["plugins/darwin.go"],
@@ -89,23 +90,41 @@ go_library(
 
 go_test(
     name = "config_test",
-    srcs = ["config/config_test.go"],
+    srcs = [
+        "config/config_test.go",
+        "config/config_pbt_test.go",
+    ],
     embed = [":config"],
+    deps = [
+        "@net_pgregory_rapid//:rapid",
+    ],
     timeout = "short",
 )
 
 go_test(
     name = "plugins_test",
-    srcs = ["plugins/plugin_test.go"],
+    srcs = [
+        "plugins/plugin_test.go",
+        "plugins/plugin_pbt_test.go",
+    ],
     embed = [":plugins"],
-    deps = [":config"],
+    deps = [
+        ":config",
+        "@net_pgregory_rapid//:rapid",
+    ],
     timeout = "short",
 )
 
 go_test(
     name = "monitor_test",
-    srcs = ["monitor/disk_test.go"],
+    srcs = [
+        "monitor/disk_test.go",
+        "monitor/monitor_pbt_test.go",
+    ],
     embed = [":monitor"],
+    deps = [
+        "@net_pgregory_rapid//:rapid",
+    ],
     timeout = "short",
 )
 
@@ -136,6 +155,16 @@ test_suite(
 # Darwin test suite (includes Darwin-specific tests when available)
 test_suite(
     name = "darwin_tests",
+    tests = [
+        ":config_test",
+        ":monitor_test",
+        ":plugins_test",
+    ],
+)
+
+# Property-based test suite (uses rapid library)
+test_suite(
+    name = "pbt_tests",
     tests = [
         ":config_test",
         ":monitor_test",

@@ -8,4 +8,6 @@ func registerDarwinPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewHomebrewPlugin())
 	registry.Register(plugins.NewIOSSimulatorPlugin())
 	registry.Register(plugins.NewXcodePlugin())
+	registry.Register(plugins.NewICloudPlugin())
+	registry.Register(plugins.NewPhotosPlugin())
 }

@@ -268,6 +268,7 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 func registerPlugins(registry *plugins.Registry) {
 	// Core plugins (all platforms)
 	registry.Register(plugins.NewDockerPlugin())
+	registry.Register(plugins.NewPodmanPlugin())
 	registry.Register(plugins.NewNixPlugin())
 	registry.Register(plugins.NewCachePlugin())
 	registry.Register(plugins.NewGitLabRunnerPlugin())

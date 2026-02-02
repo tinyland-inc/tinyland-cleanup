@@ -32,6 +32,12 @@ type Config struct {
 	// Lima VM settings (Darwin)
 	Lima LimaConfig `yaml:"lima"`
 
+	// Podman-specific settings
+	Podman PodmanConfig `yaml:"podman"`
+
+	// iCloud-specific settings (Darwin)
+	ICloud ICloudConfig `yaml:"icloud"`
+
 	// Notification settings
 	Notify NotifyConfig `yaml:"notify"`
 }
@@ -56,6 +62,8 @@ type EnableFlags struct {
 	NixGC bool `yaml:"nix_gc"`
 	// Docker for container image/volume cleanup
 	Docker bool `yaml:"docker"`
+	// Podman for Podman container/image/volume cleanup
+	Podman bool `yaml:"podman"`
 	// Lima for Lima VM cleanup (Darwin)
 	Lima bool `yaml:"lima"`
 	// Homebrew for brew cleanup (Darwin)
@@ -64,6 +72,10 @@ type EnableFlags struct {
 	IOSSimulator bool `yaml:"ios_simulator"`
 	// GitLabRunner for GitLab CI cache cleanup
 	GitLabRunner bool `yaml:"gitlab_runner"`
+	// ICloud for iCloud Drive eviction (Darwin)
+	ICloud bool `yaml:"icloud"`
+	// Photos for Photos library cache cleanup (Darwin)
+	Photos bool `yaml:"photos"`
 }
 
 // DockerConfig holds Docker-specific cleanup settings.
@@ -80,6 +92,30 @@ type DockerConfig struct {
 type LimaConfig struct {
 	// VMNames to check for Docker cleanup
 	VMNames []string `yaml:"vm_names"`
+}
+
+// PodmanConfig holds Podman-specific cleanup settings.
+type PodmanConfig struct {
+	// PruneImagesAge for images older than this duration
+	PruneImagesAge string `yaml:"prune_images_age"`
+	// ProtectRunningContainers prevents pruning images used by running containers
+	ProtectRunningContainers bool `yaml:"protect_running_containers"`
+	// MachineNames to check for cleanup (Darwin)
+	MachineNames []string `yaml:"machine_names"`
+	// CleanInsideVM enables cleanup inside Podman machine VM (Darwin)
+	CleanInsideVM bool `yaml:"clean_inside_vm"`
+	// TrimVMDisk enables fstrim inside VM to reclaim sparse disk space (Darwin)
+	TrimVMDisk bool `yaml:"trim_vm_disk"`
+}
+
+// ICloudConfig holds iCloud-specific cleanup settings (Darwin).
+type ICloudConfig struct {
+	// EvictAfterDays - only evict files not accessed for this many days
+	EvictAfterDays int `yaml:"evict_after_days"`
+	// ExcludePaths - paths within iCloud Drive to never evict
+	ExcludePaths []string `yaml:"exclude_paths"`
+	// MinFileSizeMB - only evict files larger than this (MB)
+	MinFileSizeMB int `yaml:"min_file_size_mb"`
 }
 
 // NotifyConfig holds notification settings.
@@ -109,17 +145,32 @@ func DefaultConfig() *Config {
 			Cache:        true,
 			NixGC:        true,
 			Docker:       true,
+			Podman:       true,
 			Lima:         runtime.GOOS == "darwin",
 			Homebrew:     runtime.GOOS == "darwin",
 			IOSSimulator: runtime.GOOS == "darwin",
 			GitLabRunner: true,
+			ICloud:       runtime.GOOS == "darwin",
+			Photos:       runtime.GOOS == "darwin",
 		},
 		Docker: DockerConfig{
 			PruneImagesAge:           "24h",
 			ProtectRunningContainers: true,
 		},
+		Podman: PodmanConfig{
+			PruneImagesAge:           "24h",
+			ProtectRunningContainers: true,
+			MachineNames:             []string{"podman-machine-default"},
+			CleanInsideVM:            true,
+			TrimVMDisk:               true,
+		},
 		Lima: LimaConfig{
 			VMNames: []string{"colima", "unified"},
+		},
+		ICloud: ICloudConfig{
+			EvictAfterDays: 30,
+			ExcludePaths:   []string{},
+			MinFileSizeMB:  10,
 		},
 		Notify: NotifyConfig{
 			Enabled: false,

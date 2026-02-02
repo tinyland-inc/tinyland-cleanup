@@ -5,6 +5,7 @@ go 1.23
 require (
 	github.com/shirou/gopsutil/v3 v3.24.1
 	gopkg.in/yaml.v3 v3.0.1
+	pgregory.net/rapid v1.1.0
 )
 
 require (

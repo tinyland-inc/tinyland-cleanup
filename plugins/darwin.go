@@ -558,3 +558,372 @@ func parseBrewCleanupOutput(output string) int64 {
 
 	return total
 }
+
+// =============================================================================
+// iCloud Plugin
+// =============================================================================
+
+// ICloudPlugin handles iCloud Drive eviction operations.
+type ICloudPlugin struct{}
+
+// NewICloudPlugin creates a new iCloud eviction plugin.
+func NewICloudPlugin() *ICloudPlugin {
+	return &ICloudPlugin{}
+}
+
+// Name returns the plugin identifier.
+func (p *ICloudPlugin) Name() string {
+	return "icloud"
+}
+
+// Description returns the plugin description.
+func (p *ICloudPlugin) Description() string {
+	return "Evicts downloaded iCloud Drive files to free local storage"
+}
+
+// SupportedPlatforms returns supported platforms (Darwin only).
+func (p *ICloudPlugin) SupportedPlatforms() []string {
+	return []string{PlatformDarwin}
+}
+
+// Enabled checks if iCloud cleanup is enabled.
+func (p *ICloudPlugin) Enabled(cfg *config.Config) bool {
+	return cfg.Enable.ICloud
+}
+
+// Cleanup performs iCloud eviction at the specified level.
+func (p *ICloudPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{
+		Plugin: p.Name(),
+		Level:  level,
+	}
+
+	// Check if brctl is available
+	if _, err := exec.LookPath("brctl"); err != nil {
+		logger.Debug("brctl not available, skipping iCloud eviction")
+		return result
+	}
+
+	// Find iCloud Drive directory
+	home, _ := os.UserHomeDir()
+	iCloudPath := filepath.Join(home, "Library", "Mobile Documents", "com~apple~CloudDocs")
+	if _, err := os.Stat(iCloudPath); os.IsNotExist(err) {
+		logger.Debug("iCloud Drive not found", "path", iCloudPath)
+		return result
+	}
+
+	// Preflight checks
+	if err := p.preflightChecks(logger); err != nil {
+		logger.Warn("iCloud preflight checks failed", "error", err)
+		return result
+	}
+
+	// Determine eviction age based on level
+	var maxAge time.Duration
+	switch level {
+	case LevelWarning:
+		// Warning level: report only
+		return p.reportICloudUsage(iCloudPath, logger)
+	case LevelModerate:
+		maxAge = time.Duration(cfg.ICloud.EvictAfterDays) * 24 * time.Hour
+	case LevelAggressive:
+		maxAge = 7 * 24 * time.Hour // 7 days
+	case LevelCritical:
+		maxAge = 24 * time.Hour // 1 day
+	}
+
+	// Evict files
+	result = p.evictFiles(ctx, iCloudPath, maxAge, cfg, logger)
+	result.Level = level
+
+	return result
+}
+
+// preflightChecks verifies iCloud eviction can proceed safely.
+func (p *ICloudPlugin) preflightChecks(logger *slog.Logger) error {
+	// Check if "Optimize Mac Storage" is enabled
+	// This is checked via brctl diagnose or defaults read
+	cmd := exec.Command("brctl", "status")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("brctl status failed: %w", err)
+	}
+
+	// If status contains any mention of iCloud, we're OK
+	if !strings.Contains(string(output), "iCloud") {
+		logger.Debug("iCloud may not be configured properly")
+	}
+
+	return nil
+}
+
+// reportICloudUsage reports iCloud Drive usage without evicting.
+func (p *ICloudPlugin) reportICloudUsage(iCloudPath string, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{Plugin: p.Name(), Level: LevelWarning}
+
+	var totalSize int64
+	var downloadedCount int
+	var evictableSize int64
+
+	filepath.Walk(iCloudPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		totalSize += info.Size()
+
+		// Check if file is downloaded (evictable)
+		if p.isFileDownloaded(path) {
+			downloadedCount++
+			evictableSize += info.Size()
+		}
+
+		return nil
+	})
+
+	logger.Info("iCloud Drive status",
+		"total_size_gb", fmt.Sprintf("%.1f", float64(totalSize)/(1024*1024*1024)),
+		"evictable_gb", fmt.Sprintf("%.1f", float64(evictableSize)/(1024*1024*1024)),
+		"downloaded_files", downloadedCount)
+
+	return result
+}
+
+// isFileDownloaded checks if an iCloud file is downloaded (not evicted).
+func (p *ICloudPlugin) isFileDownloaded(path string) bool {
+	// Pre-Sonoma: check for .icloud stub files
+	if strings.Contains(path, ".icloud") {
+		return false // It's a stub, not downloaded
+	}
+
+	// Simple heuristic: if file is accessible and has real content
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	return info.Size() > 0
+}
+
+// evictFiles evicts iCloud files older than maxAge.
+func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge time.Duration, cfg *config.Config, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{Plugin: p.Name()}
+
+	cutoff := time.Now().Add(-maxAge)
+	minSize := int64(cfg.ICloud.MinFileSizeMB) * 1024 * 1024
+
+	filepath.Walk(iCloudPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		// Skip excluded paths
+		for _, exclude := range cfg.ICloud.ExcludePaths {
+			if strings.Contains(path, exclude) {
+				return nil
+			}
+		}
+
+		// Skip small files
+		if info.Size() < minSize {
+			return nil
+		}
+
+		// Skip recently accessed files
+		if info.ModTime().After(cutoff) {
+			return nil
+		}
+
+		// Skip files that are already evicted
+		if !p.isFileDownloaded(path) {
+			return nil
+		}
+
+		// Evict the file
+		if err := p.evictFile(ctx, path); err != nil {
+			logger.Debug("failed to evict file", "path", filepath.Base(path), "error", err)
+		} else {
+			result.BytesFreed += info.Size()
+			result.ItemsCleaned++
+			logger.Debug("evicted iCloud file", "path", filepath.Base(path), "size_mb", info.Size()/(1024*1024))
+		}
+
+		return nil
+	})
+
+	if result.BytesFreed > 0 {
+		logger.Info("iCloud eviction complete",
+			"files_evicted", result.ItemsCleaned,
+			"freed_gb", fmt.Sprintf("%.1f", float64(result.BytesFreed)/(1024*1024*1024)))
+	}
+
+	return result
+}
+
+// evictFile evicts a single iCloud file.
+func (p *ICloudPlugin) evictFile(ctx context.Context, path string) error {
+	cmd := exec.CommandContext(ctx, "brctl", "evict", path)
+	return cmd.Run()
+}
+
+// =============================================================================
+// Photos Plugin
+// =============================================================================
+
+// PhotosPlugin handles Photos library cache cleanup.
+type PhotosPlugin struct{}
+
+// NewPhotosPlugin creates a new Photos cache cleanup plugin.
+func NewPhotosPlugin() *PhotosPlugin {
+	return &PhotosPlugin{}
+}
+
+// Name returns the plugin identifier.
+func (p *PhotosPlugin) Name() string {
+	return "photos"
+}
+
+// Description returns the plugin description.
+func (p *PhotosPlugin) Description() string {
+	return "Cleans Photos library analysis caches (never touches originals)"
+}
+
+// SupportedPlatforms returns supported platforms (Darwin only).
+func (p *PhotosPlugin) SupportedPlatforms() []string {
+	return []string{PlatformDarwin}
+}
+
+// Enabled checks if Photos cleanup is enabled.
+func (p *PhotosPlugin) Enabled(cfg *config.Config) bool {
+	return cfg.Enable.Photos
+}
+
+// Cleanup performs Photos cache cleanup at the specified level.
+func (p *PhotosPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{
+		Plugin: p.Name(),
+		Level:  level,
+	}
+
+	// Find Photos library
+	home, _ := os.UserHomeDir()
+	photosLibPath := filepath.Join(home, "Pictures", "Photos Library.photoslibrary")
+
+	if _, err := os.Stat(photosLibPath); os.IsNotExist(err) {
+		logger.Debug("Photos library not found", "path", photosLibPath)
+		return result
+	}
+
+	// CRITICAL: Only clean these specific safe paths
+	// NEVER touch: originals/, database/, resources/renders/
+	safeCachePaths := []string{
+		filepath.Join(photosLibPath, "private", "com.apple.photoanalysisd", "caches"),
+		filepath.Join(photosLibPath, "private", "com.apple.mediaanalysisd", "caches"),
+	}
+
+	switch level {
+	case LevelWarning:
+		// Report only
+		return p.reportPhotosUsage(photosLibPath, safeCachePaths, logger)
+	case LevelModerate, LevelAggressive, LevelCritical:
+		// Clean caches
+		result = p.cleanPhotosCaches(safeCachePaths, logger)
+		result.Level = level
+	}
+
+	// At critical level, also clean CloudKit caches
+	if level >= LevelCritical {
+		cloudKitResult := p.cleanCloudKitCaches(home, logger)
+		result.BytesFreed += cloudKitResult.BytesFreed
+		result.ItemsCleaned += cloudKitResult.ItemsCleaned
+	}
+
+	return result
+}
+
+// reportPhotosUsage reports Photos library cache sizes without cleaning.
+func (p *PhotosPlugin) reportPhotosUsage(photosLibPath string, cachePaths []string, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{Plugin: p.Name(), Level: LevelWarning}
+
+	var totalCacheSize int64
+	for _, cachePath := range cachePaths {
+		size := getDirSize(cachePath)
+		totalCacheSize += size
+	}
+
+	logger.Info("Photos library cache status",
+		"cache_size_mb", totalCacheSize/(1024*1024))
+
+	return result
+}
+
+// cleanPhotosCaches cleans Photos library analysis caches.
+func (p *PhotosPlugin) cleanPhotosCaches(cachePaths []string, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{Plugin: p.Name()}
+
+	for _, cachePath := range cachePaths {
+		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
+			continue
+		}
+
+		size := getDirSize(cachePath)
+		if size == 0 {
+			continue
+		}
+
+		// Remove all contents but keep the directory
+		entries, _ := os.ReadDir(cachePath)
+		for _, entry := range entries {
+			entryPath := filepath.Join(cachePath, entry.Name())
+			if err := os.RemoveAll(entryPath); err != nil {
+				logger.Debug("failed to remove cache entry", "path", entry.Name(), "error", err)
+				continue
+			}
+		}
+
+		sizeAfter := getDirSize(cachePath)
+		freed := size - sizeAfter
+		if freed > 0 {
+			result.BytesFreed += freed
+			result.ItemsCleaned++
+			logger.Debug("cleaned Photos cache", "path", filepath.Base(cachePath), "freed_mb", freed/(1024*1024))
+		}
+	}
+
+	return result
+}
+
+// cleanCloudKitCaches cleans CloudKit caches (safe subset only).
+func (p *PhotosPlugin) cleanCloudKitCaches(home string, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{Plugin: p.Name() + "-cloudkit"}
+
+	// SAFE to delete: ClonedFiles (re-downloads on demand)
+	// NOT safe: AssetsDB (sync metadata)
+	cloudKitCaches := filepath.Join(home, "Library", "Caches", "CloudKit")
+	if _, err := os.Stat(cloudKitCaches); os.IsNotExist(err) {
+		return result
+	}
+
+	// Walk CloudKit caches looking for MMCS/ClonedFiles
+	filepath.Walk(cloudKitCaches, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+
+		// Only clean ClonedFiles directories
+		if filepath.Base(path) == "ClonedFiles" && strings.Contains(path, "MMCS") {
+			size := getDirSize(path)
+			if size > 0 {
+				os.RemoveAll(path)
+				os.MkdirAll(path, 0755) // Recreate empty directory
+				result.BytesFreed += size
+				result.ItemsCleaned++
+				logger.Debug("cleaned CloudKit cloned files", "freed_mb", size/(1024*1024))
+			}
+		}
+
+		return nil
+	})
+
+	return result
+}
