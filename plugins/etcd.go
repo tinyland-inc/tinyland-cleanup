@@ -39,8 +39,11 @@ func (p *EtcdPlugin) SupportedPlatforms() []string {
 }
 
 // Enabled checks if etcd cleanup is enabled.
+// NOTE: Etcd cleanup is DISABLED until config.Config is extended with Etcd settings.
+// This plugin is a placeholder for future Kubernetes/etcd support.
 func (p *EtcdPlugin) Enabled(cfg *config.Config) bool {
-	return cfg.Enable.Etcd
+	// TODO: Add cfg.Enable.Etcd and cfg.Etcd configuration
+	return false
 }
 
 // Cleanup performs etcd cleanup at the specified level.
@@ -75,22 +78,45 @@ func (p *EtcdPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *confi
 }
 
 func (p *EtcdPlugin) isEtcdPresent(cfg *config.Config) bool {
-	_, err := os.Stat(cfg.Etcd.DataDir)
-	return err == nil
+	// TODO: When cfg.Etcd is added, check cfg.Etcd.DataDir
+	// For now, check default k3s/RKE2 locations
+	defaultPaths := []string{
+		"/var/lib/rancher/rke2/server/db/etcd",
+		"/var/lib/rancher/k3s/server/db/etcd",
+		"/var/lib/etcd",
+	}
+	for _, path := range defaultPaths {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+	return false
 }
+
+// Default etcd configuration when cfg.Etcd is not yet implemented
+const (
+	defaultEtcdDataDir          = "/var/lib/rancher/rke2/server/db/etcd"
+	defaultEtcdWALRetentionDays = 7
+	defaultEtcdSnapshotRetention = 5
+	defaultEtcdDefragThreshold  = 80
+)
 
 func (p *EtcdPlugin) cleanOldWAL(ctx context.Context, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name(), Level: LevelWarning}
 
-	walDir := filepath.Join(cfg.Etcd.DataDir, "member", "wal")
+	// Use default data dir until cfg.Etcd is implemented
+	dataDir := defaultEtcdDataDir
+	walRetentionDays := defaultEtcdWALRetentionDays
+
+	walDir := filepath.Join(dataDir, "member", "wal")
 	if _, err := os.Stat(walDir); os.IsNotExist(err) {
 		return result
 	}
 
-	logger.Debug("cleaning old WAL files", "dir", walDir, "retention_days", cfg.Etcd.WALRetentionDays)
+	logger.Debug("cleaning old WAL files", "dir", walDir, "retention_days", walRetentionDays)
 
 	// Find and remove WAL files older than retention period
-	cutoff := time.Now().AddDate(0, 0, -cfg.Etcd.WALRetentionDays)
+	cutoff := time.Now().AddDate(0, 0, -walRetentionDays)
 
 	err := filepath.Walk(walDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -123,13 +149,17 @@ func (p *EtcdPlugin) cleanModerate(ctx context.Context, cfg *config.Config, logg
 	result := p.cleanOldWAL(ctx, cfg, logger)
 	result.Level = LevelModerate
 
+	// Use default data dir until cfg.Etcd is implemented
+	dataDir := defaultEtcdDataDir
+	snapshotRetention := defaultEtcdSnapshotRetention
+
 	// Then clean old snapshots beyond retention
-	snapDir := filepath.Join(cfg.Etcd.DataDir, "member", "snap")
+	snapDir := filepath.Join(dataDir, "member", "snap")
 	if _, err := os.Stat(snapDir); os.IsNotExist(err) {
 		return result
 	}
 
-	logger.Debug("cleaning old snapshots", "dir", snapDir, "retention", cfg.Etcd.SnapshotRetention)
+	logger.Debug("cleaning old snapshots", "dir", snapDir, "retention", snapshotRetention)
 
 	// Find all snapshot files
 	var snapshots []string
@@ -159,8 +189,8 @@ func (p *EtcdPlugin) cleanModerate(ctx context.Context, cfg *config.Config, logg
 	})
 
 	// Remove snapshots beyond retention count
-	if len(snapshots) > cfg.Etcd.SnapshotRetention {
-		for _, snap := range snapshots[cfg.Etcd.SnapshotRetention:] {
+	if len(snapshots) > snapshotRetention {
+		for _, snap := range snapshots[snapshotRetention:] {
 			info, err := os.Stat(snap)
 			if err != nil {
 				continue
@@ -181,10 +211,13 @@ func (p *EtcdPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, lo
 	result := p.cleanModerate(ctx, cfg, logger)
 	result.Level = LevelAggressive
 
+	// Use default threshold until cfg.Etcd is implemented
+	defragThreshold := defaultEtcdDefragThreshold
+
 	// Check disk usage and defrag if above threshold
-	usage := p.getEtcdDiskUsage(cfg)
-	if usage >= cfg.Etcd.DefragThreshold {
-		logger.Info("etcd disk usage above threshold, running defrag", "usage", usage, "threshold", cfg.Etcd.DefragThreshold)
+	usage := p.getEtcdDiskUsage()
+	if usage >= defragThreshold {
+		logger.Info("etcd disk usage above threshold, running defrag", "usage", usage, "threshold", defragThreshold)
 		p.runDefrag(ctx, logger)
 	}
 
@@ -205,9 +238,10 @@ func (p *EtcdPlugin) cleanCritical(ctx context.Context, cfg *config.Config, logg
 	return result
 }
 
-func (p *EtcdPlugin) getEtcdDiskUsage(cfg *config.Config) int {
+func (p *EtcdPlugin) getEtcdDiskUsage() int {
 	// Get the mount point for etcd data dir and check its usage
-	cmd := exec.Command("df", cfg.Etcd.DataDir)
+	// Use default data dir until cfg.Etcd is implemented
+	cmd := exec.Command("df", defaultEtcdDataDir)
 	output, err := cmd.Output()
 	if err != nil {
 		return 0

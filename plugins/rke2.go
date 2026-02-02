@@ -39,8 +39,11 @@ func (p *RKE2Plugin) SupportedPlatforms() []string {
 }
 
 // Enabled checks if RKE2 cleanup is enabled.
+// NOTE: RKE2/k3s cleanup is DISABLED until config.Config is extended with RKE2 settings.
+// This plugin is a placeholder for future Kubernetes support.
 func (p *RKE2Plugin) Enabled(cfg *config.Config) bool {
-	return cfg.Enable.RKE2
+	// TODO: Add cfg.Enable.RKE2 to config.EnableFlags
+	return false
 }
 
 // Cleanup performs RKE2/k3s cleanup at the specified level.
