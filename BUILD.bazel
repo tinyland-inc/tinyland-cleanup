@@ -64,7 +64,10 @@ go_library(
         "plugins/podman.go",
         "plugins/rke2.go",
     ] + select({
-        "@platforms//os:macos": ["plugins/darwin.go"],
+        "@platforms//os:macos": [
+            "plugins/darwin.go",
+            "plugins/lima.go",
+        ],
         "//conditions:default": [],
     }),
     importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/plugins",
