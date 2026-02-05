@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
 )
