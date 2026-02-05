@@ -10,4 +10,5 @@ func registerDarwinPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewXcodePlugin())
 	registry.Register(plugins.NewICloudPlugin())
 	registry.Register(plugins.NewPhotosPlugin())
+	registry.Register(plugins.NewLimaPlugin())
 }

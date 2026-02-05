@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os/exec"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -69,16 +68,6 @@ func (p *DockerPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 	case LevelCritical:
 		// Emergency: full system prune with volumes
 		result = p.cleanCritical(ctx, logger)
-	}
-
-	// Also clean Lima VMs on Darwin
-	if runtime.GOOS == "darwin" && cfg.Enable.Lima {
-		limaResult := p.cleanLimaVMs(ctx, cfg, logger)
-		result.BytesFreed += limaResult.BytesFreed
-		result.ItemsCleaned += limaResult.ItemsCleaned
-		if limaResult.Error != nil && result.Error == nil {
-			result.Error = limaResult.Error
-		}
 	}
 
 	return result
@@ -165,59 +154,6 @@ func (p *DockerPlugin) cleanCritical(ctx context.Context, logger *slog.Logger) C
 	}
 
 	result.BytesFreed = p.parseReclaimedSpace(output)
-	return result
-}
-
-func (p *DockerPlugin) cleanLimaVMs(ctx context.Context, cfg *config.Config, logger *slog.Logger) CleanupResult {
-	result := CleanupResult{Plugin: p.Name() + "-lima"}
-
-	// Check if limactl is available
-	if _, err := exec.LookPath("limactl"); err != nil {
-		return result
-	}
-
-	for _, vmName := range cfg.Lima.VMNames {
-		// Check if VM is running
-		checkCmd := exec.CommandContext(ctx, "limactl", "list")
-		output, err := checkCmd.Output()
-		if err != nil {
-			continue
-		}
-
-		if !strings.Contains(string(output), vmName) || !strings.Contains(string(output), "Running") {
-			continue
-		}
-
-		logger.Debug("cleaning Docker in Lima VM", "vm", vmName)
-
-		// Clean inside the VM
-		limaResult := p.cleanLimaVM(ctx, vmName, logger)
-		result.BytesFreed += limaResult.BytesFreed
-		result.ItemsCleaned += limaResult.ItemsCleaned
-
-		// Run fstrim to reclaim sparse disk space
-		logger.Debug("running fstrim in Lima VM", "vm", vmName)
-		fstrimCmd := exec.CommandContext(ctx, "limactl", "shell", vmName, "--", "sudo", "fstrim", "-av")
-		fstrimCmd.Run() // Ignore errors
-	}
-
-	return result
-}
-
-func (p *DockerPlugin) cleanLimaVM(ctx context.Context, vmName string, logger *slog.Logger) CleanupResult {
-	result := CleanupResult{Plugin: p.Name() + "-lima-" + vmName}
-
-	commands := [][]string{
-		{"docker", "image", "prune", "-f"},
-		{"docker", "container", "prune", "-f"},
-		{"docker", "buildx", "prune", "-f"},
-	}
-
-	for _, args := range commands {
-		cmd := exec.CommandContext(ctx, "limactl", append([]string{"shell", vmName, "--"}, args...)...)
-		cmd.Run() // Best effort
-	}
-
 	return result
 }
 
