@@ -330,8 +330,6 @@ func registerPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewNixPlugin())
 	registry.Register(plugins.NewCachePlugin())
 	registry.Register(plugins.NewGitLabRunnerPlugin())
-	registry.Register(plugins.NewGitHubRunnerPlugin())
-	registry.Register(plugins.NewYumPlugin())
 
 	// Development artifact cleanup (all platforms)
 	registry.Register(plugins.NewDevArtifactsPlugin())
@@ -340,7 +338,8 @@ func registerPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewEtcdPlugin())
 	registry.Register(plugins.NewRKE2Plugin())
 
-	// Darwin-specific plugins (registered on all platforms but platform-checked)
+	// Platform-specific plugins
+	registerLinuxPlugins(registry)
 	registerDarwinPlugins(registry)
 }
 

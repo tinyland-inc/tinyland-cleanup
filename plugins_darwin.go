@@ -4,6 +4,11 @@ package main
 
 import "gitlab.com/tinyland/lab/tinyland-cleanup/plugins"
 
+func registerLinuxPlugins(registry *plugins.Registry) {
+	// Linux-specific plugins are not available on Darwin
+	_ = registry
+}
+
 func registerDarwinPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewHomebrewPlugin())
 	registry.Register(plugins.NewIOSSimulatorPlugin())
