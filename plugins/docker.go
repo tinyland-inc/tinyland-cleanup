@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -15,7 +16,9 @@ import (
 )
 
 // DockerPlugin handles Docker cleanup operations.
-type DockerPlugin struct{}
+type DockerPlugin struct {
+	socketPath string
+}
 
 // NewDockerPlugin creates a new Docker cleanup plugin.
 func NewDockerPlugin() *DockerPlugin {
@@ -49,6 +52,11 @@ func (p *DockerPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 		Level:  level,
 	}
 
+	// Store socket path from config for use in commands
+	if cfg.Docker.Socket != "" {
+		p.socketPath = cfg.Docker.Socket
+	}
+
 	// Check if docker is available
 	if !p.isDockerAvailable() {
 		logger.Debug("docker not available, skipping")
@@ -75,6 +83,9 @@ func (p *DockerPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 
 func (p *DockerPlugin) isDockerAvailable() bool {
 	cmd := exec.Command("docker", "info")
+	if p.socketPath != "" {
+		cmd.Env = append(os.Environ(), "DOCKER_HOST=unix://"+p.socketPath)
+	}
 	return cmd.Run() == nil
 }
 
@@ -168,6 +179,9 @@ func (p *DockerPlugin) runDockerCommand(ctx context.Context, args ...string) (st
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
+	if p.socketPath != "" {
+		cmd.Env = append(os.Environ(), "DOCKER_HOST=unix://"+p.socketPath)
+	}
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }

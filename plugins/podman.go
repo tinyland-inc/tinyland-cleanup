@@ -381,7 +381,9 @@ func detectRunningMachine() (bool, string) {
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		parts := strings.Split(line, "\t")
 		if len(parts) >= 2 && strings.ToLower(parts[1]) == "true" {
-			return true, parts[0]
+			// Strip trailing "*" which marks the default machine
+			name := strings.TrimRight(parts[0], "*")
+			return true, name
 		}
 	}
 
@@ -568,24 +570,56 @@ func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) 
 	return 0, nil
 }
 
-// getMachineDiskPath extracts the disk image path from podman machine inspect.
+// getMachineDiskPath extracts the disk image path from podman machine config.
 func (p *PodmanPlugin) getMachineDiskPath(ctx context.Context) (string, error) {
+	// Strategy 1: Try podman machine inspect for ImagePath/DiskPath (older Podman)
 	cmd := exec.CommandContext(ctx, "podman", "machine", "inspect", p.environment.MachineName)
-	output, err := cmd.Output()
+	if output, err := cmd.Output(); err == nil {
+		outputStr := string(output)
+		// Check for simple string value: "ImagePath": "/path/to/disk"
+		for _, key := range []string{"ImagePath", "DiskPath"} {
+			re := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]+)"`, key))
+			if matches := re.FindStringSubmatch(outputStr); len(matches) > 1 {
+				return matches[1], nil
+			}
+		}
+
+		// Extract ConfigDir for strategy 2
+		configDirRe := regexp.MustCompile(`"ConfigDir"\s*:\s*\{\s*"Path"\s*:\s*"([^"]+)"`)
+		if matches := configDirRe.FindStringSubmatch(outputStr); len(matches) > 1 {
+			configDir := matches[1]
+			return p.readDiskPathFromConfig(configDir)
+		}
+	}
+
+	// Strategy 2: Read internal config JSON from known provider paths
+	home, _ := os.UserHomeDir()
+	providers := []string{"libkrun", "applehv", "qemu"}
+	for _, provider := range providers {
+		configDir := filepath.Join(home, ".config/containers/podman/machine", provider)
+		if path, err := p.readDiskPathFromConfig(configDir); err == nil {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("disk path not found in machine config")
+}
+
+// readDiskPathFromConfig reads the disk image path from a machine config JSON file.
+func (p *PodmanPlugin) readDiskPathFromConfig(configDir string) (string, error) {
+	configFile := filepath.Join(configDir, p.environment.MachineName+".json")
+	data, err := os.ReadFile(configFile)
 	if err != nil {
 		return "", err
 	}
 
-	// Parse JSON output for ImagePath or DiskPath
-	outputStr := string(output)
-	for _, key := range []string{"ImagePath", "DiskPath"} {
-		re := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]+)"`, key))
-		if matches := re.FindStringSubmatch(outputStr); len(matches) > 1 {
-			return matches[1], nil
-		}
+	// Parse nested ImagePath: {"Path": "/path/to/disk.raw"}
+	re := regexp.MustCompile(`"ImagePath"\s*:\s*\{\s*"Path"\s*:\s*"([^"]+)"`)
+	if matches := re.FindStringSubmatch(string(data)); len(matches) > 1 {
+		return matches[1], nil
 	}
 
-	return "", fmt.Errorf("disk path not found in machine inspect output")
+	return "", fmt.Errorf("ImagePath not found in %s", configFile)
 }
 
 // cleanInsideVM runs cleanup commands inside the Podman VM.
