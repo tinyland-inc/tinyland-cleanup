@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
@@ -70,6 +71,31 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 		}
 	}
 
+	// Go build cache (moderate+, separate from module cache)
+	if level >= LevelModerate {
+		if _, err := exec.LookPath("go"); err == nil {
+			if output, err := exec.CommandContext(ctx, "go", "env", "GOCACHE").Output(); err == nil {
+				goCacheDir := strings.TrimSpace(string(output))
+				if goCacheDir != "" && goCacheDir != "off" {
+					sizeBefore := getDirSize(goCacheDir)
+					if sizeBefore > 0 {
+						if level >= LevelAggressive {
+							exec.CommandContext(ctx, "go", "clean", "-cache").Run()
+						} else {
+							exec.CommandContext(ctx, "go", "clean", "-testcache").Run()
+						}
+						sizeAfter := getDirSize(goCacheDir)
+						freed := safeBytesDiff(sizeBefore, sizeAfter)
+						result.BytesFreed += freed
+						if freed > 0 {
+							logger.Debug("cleaned go build cache", "freed_mb", freed/(1024*1024))
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// go module cache (only at aggressive or higher)
 	if level >= LevelAggressive {
 		goModCache := filepath.Join(home, "go", "pkg", "mod", "cache")
@@ -88,6 +114,31 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 			deleteOldFiles(cargoCache, 30*24*time.Hour)
 			sizeAfter := getDirSize(cargoCache)
 			result.BytesFreed += safeBytesDiff(sizeBefore, sizeAfter)
+		}
+
+		// cargo clean gc (Rust 1.82+ automatic garbage collection)
+		if _, err := exec.LookPath("cargo"); err == nil {
+			exec.CommandContext(ctx, "cargo", "cache", "--autoclean").Run()
+		}
+	}
+
+	// Rustup toolchain cleanup (critical only - keep default toolchain)
+	if level >= LevelCritical {
+		if _, err := exec.LookPath("rustup"); err == nil {
+			// Remove all non-default toolchains
+			output, err := exec.CommandContext(ctx, "rustup", "toolchain", "list").Output()
+			if err == nil {
+				for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" || strings.Contains(line, "(default)") {
+						continue
+					}
+					toolchain := strings.Fields(line)[0]
+					logger.Debug("removing non-default rustup toolchain", "toolchain", toolchain)
+					exec.CommandContext(ctx, "rustup", "toolchain", "uninstall", toolchain).Run()
+					result.ItemsCleaned++
+				}
+			}
 		}
 	}
 

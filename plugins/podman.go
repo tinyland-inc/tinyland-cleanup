@@ -249,10 +249,18 @@ func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, lo
 			}
 		}
 
-		// For QEMU provider, warn about offline compaction
-		if p.environment.VMProvider == "qemu" {
+		// Offline disk compaction (opt-in only)
+		if cfg.Podman.CompactDiskOffline {
+			compactFreed, err := p.compactRawDisk(ctx, logger)
+			if err != nil {
+				logger.Warn("Podman disk compaction failed", "error", err)
+			} else if compactFreed > 0 {
+				result.BytesFreed += compactFreed
+				result.ItemsCleaned++
+			}
+		} else if p.environment.VMProvider == "qemu" {
 			logger.Warn("CRITICAL: qcow2 disk may benefit from offline compaction",
-				"suggestion", "podman machine stop && qemu-img convert -O qcow2 <image> <compacted>")
+				"suggestion", "enable podman.compact_disk_offline in config")
 		}
 	}
 
@@ -442,6 +450,142 @@ func parseFstrimOutput(output string) int64 {
 		}
 	}
 	return total
+}
+
+// compactRawDisk performs offline disk compaction for the Podman machine VM.
+// For raw disk images (applehv, libkrun): creates a sparse copy via qemu-img.
+// For qcow2 (qemu): converts to reclaim space.
+// ONLY runs at Critical level with explicit opt-in via config.
+func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) (int64, error) {
+	if !p.environment.VMRunning || p.environment.MachineName == "" {
+		return 0, nil
+	}
+
+	// Check if qemu-img is available
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		return 0, fmt.Errorf("qemu-img not available: %w", err)
+	}
+
+	// Get raw disk file path from podman machine inspect
+	diskPath, err := p.getMachineDiskPath(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("cannot determine disk path: %w", err)
+	}
+	if diskPath == "" {
+		return 0, fmt.Errorf("empty disk path for machine %s", p.environment.MachineName)
+	}
+
+	// Get current size
+	stat, err := os.Stat(diskPath)
+	if err != nil {
+		return 0, fmt.Errorf("cannot stat disk: %w", err)
+	}
+	sizeBefore := stat.Size()
+
+	// Determine disk format based on provider
+	var diskFormat string
+	switch p.environment.VMProvider {
+	case "applehv", "libkrun":
+		diskFormat = "raw"
+	case "qemu":
+		diskFormat = "qcow2"
+	default:
+		return 0, fmt.Errorf("unsupported VM provider for compaction: %s", p.environment.VMProvider)
+	}
+
+	sparsePath := diskPath + ".sparse"
+
+	logger.Warn("CRITICAL: stopping Podman machine for disk compaction",
+		"machine", p.environment.MachineName, "format", diskFormat)
+
+	// 1. Stop machine
+	stopCmd := exec.CommandContext(ctx, "podman", "machine", "stop", p.environment.MachineName)
+	if output, err := stopCmd.CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("failed to stop machine: %w (output: %s)", err, string(output))
+	}
+	p.environment.VMRunning = false
+
+	// 2. Convert to sparse copy
+	logger.Info("compacting Podman machine disk", "machine", p.environment.MachineName)
+	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert",
+		"-f", diskFormat, "-O", diskFormat, diskPath, sparsePath)
+	if output, err := convertCmd.CombinedOutput(); err != nil {
+		os.Remove(sparsePath)
+		// Restart machine before returning
+		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+		p.environment.VMRunning = true
+		return 0, fmt.Errorf("qemu-img convert failed: %w (output: %s)", err, string(output))
+	}
+
+	// 3. Verify if qcow2 format
+	if diskFormat == "qcow2" {
+		checkCmd := exec.CommandContext(ctx, "qemu-img", "check", sparsePath)
+		if output, err := checkCmd.CombinedOutput(); err != nil {
+			os.Remove(sparsePath)
+			exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+			p.environment.VMRunning = true
+			return 0, fmt.Errorf("qemu-img check failed: %w (output: %s)", err, string(output))
+		}
+	}
+
+	// 4. Get compacted size
+	sparseStat, err := os.Stat(sparsePath)
+	if err != nil {
+		os.Remove(sparsePath)
+		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+		p.environment.VMRunning = true
+		return 0, fmt.Errorf("cannot stat compacted disk: %w", err)
+	}
+
+	// 5. Replace original
+	if err := os.Rename(sparsePath, diskPath); err != nil {
+		os.Remove(sparsePath)
+		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+		p.environment.VMRunning = true
+		return 0, fmt.Errorf("failed to replace disk: %w", err)
+	}
+
+	// 6. Restart machine
+	logger.Info("restarting Podman machine after compaction", "machine", p.environment.MachineName)
+	startCmd := exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName)
+	if output, err := startCmd.CombinedOutput(); err != nil {
+		logger.Error("failed to restart machine after compaction",
+			"machine", p.environment.MachineName, "error", err, "output", string(output))
+	}
+	p.environment.VMRunning = true
+
+	freed := sizeBefore - sparseStat.Size()
+	if freed > 0 {
+		logger.Info("Podman disk compaction complete",
+			"machine", p.environment.MachineName,
+			"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1024*1024*1024)),
+			"before_gb", fmt.Sprintf("%.1f", float64(sizeBefore)/(1024*1024*1024)),
+			"after_gb", fmt.Sprintf("%.1f", float64(sparseStat.Size())/(1024*1024*1024)),
+		)
+		return freed, nil
+	}
+
+	return 0, nil
+}
+
+// getMachineDiskPath extracts the disk image path from podman machine inspect.
+func (p *PodmanPlugin) getMachineDiskPath(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "podman", "machine", "inspect", p.environment.MachineName)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	// Parse JSON output for ImagePath or DiskPath
+	outputStr := string(output)
+	for _, key := range []string{"ImagePath", "DiskPath"} {
+		re := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]+)"`, key))
+		if matches := re.FindStringSubmatch(outputStr); len(matches) > 1 {
+			return matches[1], nil
+		}
+	}
+
+	return "", fmt.Errorf("disk path not found in machine inspect output")
 }
 
 // cleanInsideVM runs cleanup commands inside the Podman VM.

@@ -44,6 +44,12 @@ type Config struct {
 	// Monitored mount points (multi-volume support)
 	MonitoredMounts []MountConfig `yaml:"monitored_mounts"`
 
+	// Dev artifact cleanup settings
+	DevArtifacts DevArtifactsConfig `yaml:"dev_artifacts"`
+
+	// APFS snapshot settings (Darwin)
+	APFS APFSConfig `yaml:"apfs"`
+
 	// Notification settings
 	Notify NotifyConfig `yaml:"notify"`
 }
@@ -106,6 +112,10 @@ type EnableFlags struct {
 	ICloud bool `yaml:"icloud"`
 	// Photos for Photos library cache cleanup (Darwin)
 	Photos bool `yaml:"photos"`
+	// DevArtifacts for stale development artifact cleanup
+	DevArtifacts bool `yaml:"dev_artifacts"`
+	// APFSSnapshots for APFS snapshot thinning (Darwin)
+	APFSSnapshots bool `yaml:"apfs_snapshots"`
 }
 
 // DockerConfig holds Docker-specific cleanup settings.
@@ -122,6 +132,8 @@ type DockerConfig struct {
 type LimaConfig struct {
 	// VMNames to check for Docker cleanup
 	VMNames []string `yaml:"vm_names"`
+	// CompactOffline enables offline qcow2 compaction at Critical level
+	CompactOffline bool `yaml:"compact_offline"`
 }
 
 // PodmanConfig holds Podman-specific cleanup settings.
@@ -136,6 +148,8 @@ type PodmanConfig struct {
 	CleanInsideVM bool `yaml:"clean_inside_vm"`
 	// TrimVMDisk enables fstrim inside VM to reclaim sparse disk space (Darwin)
 	TrimVMDisk bool `yaml:"trim_vm_disk"`
+	// CompactDiskOffline enables offline raw disk compaction at Critical level
+	CompactDiskOffline bool `yaml:"compact_disk_offline"`
 }
 
 // ICloudConfig holds iCloud-specific cleanup settings (Darwin).
@@ -146,6 +160,38 @@ type ICloudConfig struct {
 	ExcludePaths []string `yaml:"exclude_paths"`
 	// MinFileSizeMB - only evict files larger than this (MB)
 	MinFileSizeMB int `yaml:"min_file_size_mb"`
+}
+
+// DevArtifactsConfig holds development artifact cleanup settings.
+type DevArtifactsConfig struct {
+	// ScanPaths is the list of directories to scan for dev artifacts
+	ScanPaths []string `yaml:"scan_paths"`
+	// NodeModules enables node_modules cleanup
+	NodeModules bool `yaml:"node_modules"`
+	// PythonVenvs enables .venv cleanup
+	PythonVenvs bool `yaml:"python_venvs"`
+	// RustTargets enables Rust target/ cleanup
+	RustTargets bool `yaml:"rust_targets"`
+	// GoBuildCache enables Go build cache cleanup
+	GoBuildCache bool `yaml:"go_build_cache"`
+	// HaskellCache enables .ghcup/cache and .cabal/store cleanup
+	HaskellCache bool `yaml:"haskell_cache"`
+	// LMStudioModels enables .lmstudio model cleanup (opt-in)
+	LMStudioModels bool `yaml:"lmstudio_models"`
+	// ProtectPaths are paths that should never be cleaned
+	ProtectPaths []string `yaml:"protect_paths"`
+}
+
+// APFSConfig holds APFS snapshot cleanup settings (Darwin).
+type APFSConfig struct {
+	// ThinEnabled enables APFS snapshot thinning
+	ThinEnabled bool `yaml:"thin_enabled"`
+	// MaxThinGB is the maximum GB to request for thinning
+	MaxThinGB int `yaml:"max_thin_gb"`
+	// KeepRecentDays keeps snapshots newer than this many days
+	KeepRecentDays int `yaml:"keep_recent_days"`
+	// DeleteOSUpdates allows deleting pre-update snapshots at Critical level
+	DeleteOSUpdates bool `yaml:"delete_os_updates"`
 }
 
 // NotifyConfig holds notification settings.
@@ -160,6 +206,12 @@ type NotifyConfig struct {
 func DefaultConfig() *Config {
 	home, _ := os.UserHomeDir()
 	logFile := filepath.Join(home, ".local", "log", "disk-cleanup.log")
+
+	defaultScanPaths := []string{
+		filepath.Join(home, "git"),
+		filepath.Join(home, "src"),
+		filepath.Join(home, "projects"),
+	}
 
 	config := &Config{
 		PollInterval: 60,
@@ -180,8 +232,10 @@ func DefaultConfig() *Config {
 			Homebrew:     runtime.GOOS == "darwin",
 			IOSSimulator: runtime.GOOS == "darwin",
 			GitLabRunner: true,
-			ICloud:       runtime.GOOS == "darwin",
-			Photos:       runtime.GOOS == "darwin",
+			ICloud:        runtime.GOOS == "darwin",
+			Photos:        runtime.GOOS == "darwin",
+			DevArtifacts:  true,
+			APFSSnapshots: runtime.GOOS == "darwin",
 		},
 		Docker: DockerConfig{
 			PruneImagesAge:           "24h",
@@ -201,6 +255,22 @@ func DefaultConfig() *Config {
 			EvictAfterDays: 30,
 			ExcludePaths:   []string{},
 			MinFileSizeMB:  10,
+		},
+		DevArtifacts: DevArtifactsConfig{
+			ScanPaths:      defaultScanPaths,
+			NodeModules:    true,
+			PythonVenvs:    true,
+			RustTargets:    true,
+			GoBuildCache:   true,
+			HaskellCache:   true,
+			LMStudioModels: false,
+			ProtectPaths:   []string{},
+		},
+		APFS: APFSConfig{
+			ThinEnabled:    true,
+			MaxThinGB:      50,
+			KeepRecentDays: 1,
+			DeleteOSUpdates: true,
 		},
 		Notify: NotifyConfig{
 			Enabled: false,

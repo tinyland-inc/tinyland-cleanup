@@ -234,18 +234,17 @@ func (p *IOSSimulatorPlugin) cleanCritical(ctx context.Context, logger *slog.Log
 		logger.Warn("CRITICAL: iOS Simulator runtimes",
 			"size_gb", fmt.Sprintf("%.1f", float64(runtimeSize)/(1024*1024*1024)))
 
-		// Try passwordless sudo first
-		testCmd := exec.Command("sudo", "-n", "true")
-		if testCmd.Run() == nil {
+		sudoCap := DetectSudo(ctx)
+		if sudoCap.Passwordless {
 			logger.Warn("CRITICAL: deleting all iOS Simulator runtimes")
-			deleteCmd := exec.CommandContext(ctx, "sudo", "xcrun", "simctl", "runtime", "delete", "all")
-			if err := deleteCmd.Run(); err != nil {
-				logger.Error("failed to delete runtimes", "error", err)
+			output, err := RunWithSudo(ctx, "xcrun", "simctl", "runtime", "delete", "all")
+			if err != nil {
+				logger.Error("failed to delete runtimes", "error", err, "output", string(output))
 			} else {
 				result.BytesFreed += runtimeSize
 			}
 		} else {
-			logger.Warn("sudo not available, skipping runtime deletion")
+			logger.Warn("passwordless sudo not available, skipping runtime deletion")
 		}
 	}
 
@@ -466,6 +465,31 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 		}
 	}
 
+	// Go build cache (moderate+, separate from module cache)
+	if level >= LevelModerate {
+		if _, err := exec.LookPath("go"); err == nil {
+			if output, err := exec.CommandContext(ctx, "go", "env", "GOCACHE").Output(); err == nil {
+				goCacheDir := strings.TrimSpace(string(output))
+				if goCacheDir != "" && goCacheDir != "off" {
+					sizeBefore := getDirSize(goCacheDir)
+					if sizeBefore > 0 {
+						if level >= LevelAggressive {
+							exec.CommandContext(ctx, "go", "clean", "-cache").Run()
+						} else {
+							exec.CommandContext(ctx, "go", "clean", "-testcache").Run()
+						}
+						sizeAfter := getDirSize(goCacheDir)
+						freed := safeBytesDiff(sizeBefore, sizeAfter)
+						result.BytesFreed += freed
+						if freed > 0 {
+							logger.Debug("cleaned go build cache", "freed_mb", freed/(1024*1024))
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// go module cache (only at aggressive or higher)
 	if level >= LevelAggressive {
 		goModCache := filepath.Join(home, "go", "pkg", "mod", "cache")
@@ -483,7 +507,31 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 			sizeBefore := getDirSize(cargoCache)
 			deleteOldFiles(cargoCache, 30*24*time.Hour)
 			sizeAfter := getDirSize(cargoCache)
-			result.BytesFreed += sizeBefore - sizeAfter
+			result.BytesFreed += safeBytesDiff(sizeBefore, sizeAfter)
+		}
+
+		// cargo clean gc (Rust 1.82+ automatic garbage collection)
+		if _, err := exec.LookPath("cargo"); err == nil {
+			exec.CommandContext(ctx, "cargo", "cache", "--autoclean").Run()
+		}
+	}
+
+	// Rustup toolchain cleanup (critical only - keep default toolchain)
+	if level >= LevelCritical {
+		if _, err := exec.LookPath("rustup"); err == nil {
+			output, err := exec.CommandContext(ctx, "rustup", "toolchain", "list").Output()
+			if err == nil {
+				for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" || strings.Contains(line, "(default)") {
+						continue
+					}
+					toolchain := strings.Fields(line)[0]
+					logger.Debug("removing non-default rustup toolchain", "toolchain", toolchain)
+					exec.CommandContext(ctx, "rustup", "toolchain", "uninstall", toolchain).Run()
+					result.ItemsCleaned++
+				}
+			}
 		}
 	}
 

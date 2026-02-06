@@ -333,6 +333,9 @@ func registerPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewGitHubRunnerPlugin())
 	registry.Register(plugins.NewYumPlugin())
 
+	// Development artifact cleanup (all platforms)
+	registry.Register(plugins.NewDevArtifactsPlugin())
+
 	// Kubernetes plugins (disabled by default, for future use)
 	registry.Register(plugins.NewEtcdPlugin())
 	registry.Register(plugins.NewRKE2Plugin())
