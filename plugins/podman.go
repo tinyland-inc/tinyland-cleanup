@@ -193,13 +193,23 @@ func (p *PodmanPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 
 	// On Darwin, run fstrim inside VM to reclaim sparse disk space
 	if runtime.GOOS == "darwin" && p.environment.VMRunning && cfg.Podman.TrimVMDisk {
-		logger.Debug("running fstrim in Podman VM", "machine", p.environment.MachineName)
-		if trimmed, err := p.trimVMDisk(ctx, logger); err == nil && trimmed > 0 {
-			result.BytesFreed += trimmed
-			result.ItemsCleaned++
-			logger.Info("reclaimed sparse disk space from Podman VM", "freed_mb", trimmed/(1024*1024))
-		} else if err != nil {
-			logger.Warn("fstrim in Podman VM failed", "error", err)
+		// applehv with raw disk images: fstrim marks blocks unused inside the
+		// guest but Apple's Virtualization.framework does NOT hole-punch the
+		// host raw file. Only offline compaction via qemu-img can shrink it.
+		if p.environment.VMProvider == "applehv" {
+			logger.Warn("fstrim has no host-side effect on applehv raw disks; "+
+				"enable podman.compact_disk_offline for actual reclamation",
+				"machine", p.environment.MachineName,
+				"provider", p.environment.VMProvider)
+		} else {
+			logger.Debug("running fstrim in Podman VM", "machine", p.environment.MachineName)
+			if trimmed, err := p.trimVMDisk(ctx, logger); err == nil && trimmed > 0 {
+				result.BytesFreed += trimmed
+				result.ItemsCleaned++
+				logger.Info("reclaimed sparse disk space from Podman VM", "freed_mb", trimmed/(1024*1024))
+			} else if err != nil {
+				logger.Warn("fstrim in Podman VM failed", "error", err)
+			}
 		}
 	}
 

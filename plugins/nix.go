@@ -54,9 +54,14 @@ func (p *NixPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config
 	}
 
 	switch level {
-	case LevelWarning, LevelModerate:
-		// Light/moderate: just nix-collect-garbage (no -d flag)
+	case LevelWarning:
+		// Warning: nix-collect-garbage without -d (keeps generations)
 		result = p.collectGarbage(ctx, false, logger)
+	case LevelModerate:
+		// Moderate: nix-collect-garbage -d (delete old generations)
+		// Without -d, old generations keep all store paths referenced,
+		// making GC a no-op when many generations exist (e.g. 23G /nix/store).
+		result = p.collectGarbage(ctx, true, logger)
 	case LevelAggressive:
 		// Aggressive: nix-collect-garbage -d (delete old generations)
 		result = p.collectGarbage(ctx, true, logger)

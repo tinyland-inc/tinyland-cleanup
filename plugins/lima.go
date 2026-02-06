@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
 )
@@ -229,7 +230,7 @@ func (p *LimaPlugin) runFSTrim(ctx context.Context, vmName string, logger *slog.
 
 	// Parse fstrim output for bytes trimmed
 	// Example: "/var: 1.5 GiB (1610612736 bytes) trimmed on /dev/vda1"
-	re := regexp.MustCompile(`(\d+)\s+bytes?\s+trimmed`)
+	re := regexp.MustCompile(`\((\d+) bytes\) trimmed`)
 	matches := re.FindAllStringSubmatch(string(output), -1)
 	var totalTrimmed int64
 	for _, match := range matches {
@@ -502,16 +503,15 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 }
 
 // getActualDiskSize returns the actual disk blocks used (not apparent size).
+// For sparse files like qcow2/raw VM images, this reflects the real on-disk usage
+// rather than the logical file size.
 func (p *LimaPlugin) getActualDiskSize(path string) int64 {
-	// Use stat to get actual block usage
-	var stat os.FileInfo
-	stat, err := os.Stat(path)
-	if err != nil {
+	var stat syscall.Stat_t
+	if err := syscall.Stat(path, &stat); err != nil {
 		return 0
 	}
-	// On Unix, Sys() returns *syscall.Stat_t which has Blocks
-	// Use apparent size as fallback
-	return stat.Size()
+	// Blocks is in 512-byte units on Darwin/Linux
+	return stat.Blocks * 512
 }
 
 func contains(slice []string, item string) bool {
