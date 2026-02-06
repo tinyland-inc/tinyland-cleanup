@@ -690,8 +690,10 @@ func (p *ICloudPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 // preflightChecks verifies iCloud eviction can proceed safely.
 func (p *ICloudPlugin) preflightChecks(logger *slog.Logger) error {
 	// Check if "Optimize Mac Storage" is enabled
-	// This is checked via brctl diagnose or defaults read
-	cmd := exec.Command("brctl", "status")
+	// brctl can hang indefinitely if CloudKit is unresponsive, so use a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "brctl", "status")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("brctl status failed: %w", err)
