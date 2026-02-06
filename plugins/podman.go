@@ -484,6 +484,21 @@ func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) 
 	}
 	sizeBefore := stat.Size()
 
+	// Safety check: ensure enough free space for the temporary copy.
+	// qemu-img convert writes a full copy before we can remove the original,
+	// so we need at least the disk image size in free space.
+	diskDir := filepath.Dir(diskPath)
+	freeSpace, err := getFreeDiskSpace(diskDir)
+	if err != nil {
+		return 0, fmt.Errorf("cannot check free space: %w", err)
+	}
+	if freeSpace < uint64(sizeBefore) {
+		logger.Warn("skipping Podman disk compaction: insufficient free space",
+			"disk_size_gb", fmt.Sprintf("%.1f", float64(sizeBefore)/(1024*1024*1024)),
+			"free_gb", fmt.Sprintf("%.1f", float64(freeSpace)/(1024*1024*1024)))
+		return 0, nil
+	}
+
 	// Determine disk format based on provider
 	var diskFormat string
 	switch p.environment.VMProvider {

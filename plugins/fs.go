@@ -138,6 +138,16 @@ func deleteOldFilesOwnedByUserSameDevice(dir string, maxAge time.Duration) int64
 	return freed
 }
 
+// getFreeDiskSpace returns the available disk space in bytes for the
+// filesystem containing the given path.
+func getFreeDiskSpace(path string) (uint64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	return stat.Bavail * uint64(stat.Bsize), nil
+}
+
 // safeBytesDiff returns the difference between two sizes, floored at 0.
 // Prevents negative BytesFreed when files are added during cleanup.
 func safeBytesDiff(before, after int64) int64 {

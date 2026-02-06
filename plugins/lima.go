@@ -422,6 +422,20 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 		}
 	}
 
+	// Safety check: ensure enough free space for the temporary copy
+	diskDir := filepath.Dir(vm.DiskPath)
+	freeSpace, err := getFreeDiskSpace(diskDir)
+	if err != nil {
+		return 0, fmt.Errorf("cannot check free space: %w", err)
+	}
+	if freeSpace < uint64(hostSizeBefore) {
+		logger.Warn("skipping Lima disk compaction: insufficient free space",
+			"vm", vm.Name,
+			"disk_size_gb", fmt.Sprintf("%.1f", float64(hostSizeBefore)/(1024*1024*1024)),
+			"free_gb", fmt.Sprintf("%.1f", float64(freeSpace)/(1024*1024*1024)))
+		return 0, nil
+	}
+
 	compactPath := vm.DiskPath + ".compact"
 
 	logger.Warn("CRITICAL: stopping Lima VM for disk compaction", "vm", vm.Name)
