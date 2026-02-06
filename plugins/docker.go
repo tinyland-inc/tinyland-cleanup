@@ -29,7 +29,7 @@ func (p *DockerPlugin) Name() string {
 
 // Description returns the plugin description.
 func (p *DockerPlugin) Description() string {
-	return "Cleans Docker images, containers, volumes, and build cache"
+	return "Cleans Docker images, containers, volumes, networks, and build cache"
 }
 
 // SupportedPlatforms returns supported platforms (all).
@@ -130,6 +130,12 @@ func (p *DockerPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 	// Clean unused volumes
 	logger.Debug("cleaning unused volumes")
 	if output, err := p.runDockerCommand(ctx, "volume", "prune", "-f"); err == nil {
+		result.BytesFreed += p.parseReclaimedSpace(output)
+	}
+
+	// Clean unused networks
+	logger.Debug("cleaning unused networks")
+	if output, err := p.runDockerCommand(ctx, "network", "prune", "-f"); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
 	}
 

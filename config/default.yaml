@@ -17,13 +17,36 @@ target_free: 70
 
 # Enable/disable specific cleanup plugins
 enable:
-  cache: true           # pip, npm, go, cargo caches
+  cache: true           # pip, npm, go, cargo, maven, gradle caches
   nix_gc: true          # nix-collect-garbage
-  docker: true          # Docker image/volume/builder cleanup
+  docker: true          # Docker image/volume/network/builder cleanup
   lima: true            # Lima VM cleanup (Darwin only)
   homebrew: true        # Homebrew cleanup (Darwin only)
   ios_simulator: true   # iOS Simulator cleanup (Darwin only)
   gitlab_runner: true   # GitLab runner cache cleanup
+  github_runner: true   # GitHub Actions runner cleanup (Linux only)
+  yum: true             # DNF/YUM package cache cleanup (Linux only)
+
+# GitHub Actions runner settings (Linux only)
+github_runner:
+  home: "/home/github-runner"
+  work_dir: ""  # Default: <home>/_work
+
+# Monitored mount points (multi-volume support)
+# When configured, all listed mounts are checked and the highest cleanup
+# level triggers cleanup. Supports per-mount threshold overrides.
+# If empty, falls back to monitoring $HOME (original behavior).
+# monitored_mounts:
+#   - path: "/"
+#     label: "root"
+#   - path: "/var/lib/docker"
+#     label: "docker"
+#     threshold_warning: 70
+#     threshold_critical: 85
+#   - path: "/nix"
+#     label: "nix"
+#     threshold_warning: 70
+#     threshold_critical: 85
 
 # Docker-specific settings
 docker:

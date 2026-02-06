@@ -38,8 +38,34 @@ type Config struct {
 	// iCloud-specific settings (Darwin)
 	ICloud ICloudConfig `yaml:"icloud"`
 
+	// GitHub Actions runner settings (Linux)
+	GitHubRunner GitHubRunnerConfig `yaml:"github_runner"`
+
+	// Monitored mount points (multi-volume support)
+	MonitoredMounts []MountConfig `yaml:"monitored_mounts"`
+
 	// Notification settings
 	Notify NotifyConfig `yaml:"notify"`
+}
+
+// GitHubRunnerConfig holds GitHub Actions runner cleanup settings.
+type GitHubRunnerConfig struct {
+	// Home directory for the runner (default: /home/github-runner)
+	Home string `yaml:"home"`
+	// WorkDir is the work directory (default: <home>/_work)
+	WorkDir string `yaml:"work_dir"`
+}
+
+// MountConfig defines a mount point to monitor with optional custom thresholds.
+type MountConfig struct {
+	// Path is the mount point path
+	Path string `yaml:"path"`
+	// Label is a human-readable label for logging
+	Label string `yaml:"label"`
+	// ThresholdWarning overrides the global warning threshold
+	ThresholdWarning int `yaml:"threshold_warning,omitempty"`
+	// ThresholdCritical overrides the global critical threshold
+	ThresholdCritical int `yaml:"threshold_critical,omitempty"`
 }
 
 // Thresholds defines disk usage thresholds for graduated cleanup.
@@ -72,6 +98,10 @@ type EnableFlags struct {
 	IOSSimulator bool `yaml:"ios_simulator"`
 	// GitLabRunner for GitLab CI cache cleanup
 	GitLabRunner bool `yaml:"gitlab_runner"`
+	// GitHubRunner for GitHub Actions runner cleanup (Linux)
+	GitHubRunner bool `yaml:"github_runner"`
+	// Yum for DNF/YUM package cache cleanup (Linux)
+	Yum bool `yaml:"yum"`
 	// ICloud for iCloud Drive eviction (Darwin)
 	ICloud bool `yaml:"icloud"`
 	// Photos for Photos library cache cleanup (Darwin)

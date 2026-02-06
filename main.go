@@ -197,30 +197,12 @@ func (d *daemon) run(ctx context.Context) error {
 }
 
 func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) error {
-	// Check disk usage - use home directory to get correct volume on macOS APFS
-	// On macOS, "/" is the sealed system volume, but user data is on /System/Volumes/Data
-	// Using $HOME ensures we monitor the volume where data actually lives
-	monitorPath := "/"
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		monitorPath = home
-	}
+	// Determine which mount points to monitor
+	level := forcedLevel
 
-	stats, detectedLevel, err := d.monitor.Check(monitorPath)
-	if err != nil {
-		return fmt.Errorf("failed to check disk: %w", err)
+	if level == monitor.LevelNone {
+		level = d.checkMounts()
 	}
-
-	// Use forced level if specified, otherwise use detected level
-	level := detectedLevel
-	if forcedLevel != monitor.LevelNone {
-		level = forcedLevel
-	}
-
-	d.logger.Info("disk status",
-		"used_percent", fmt.Sprintf("%.1f%%", stats.UsedPercent),
-		"free_gb", fmt.Sprintf("%.1fGB", stats.FreeGB),
-		"level", level.String(),
-	)
 
 	if level == monitor.LevelNone {
 		return nil
@@ -265,6 +247,82 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 	return nil
 }
 
+// checkMounts monitors all configured mount points and returns the highest
+// cleanup level detected across all of them. Falls back to home directory
+// monitoring if no mounts are configured.
+func (d *daemon) checkMounts() monitor.CleanupLevel {
+	highestLevel := monitor.LevelNone
+
+	if len(d.config.MonitoredMounts) > 0 {
+		// Multi-mount monitoring: check each configured mount point
+		for _, mount := range d.config.MonitoredMounts {
+			stats, err := monitor.GetDiskStats(mount.Path)
+			if err != nil {
+				d.logger.Warn("failed to check mount", "path", mount.Path, "label", mount.Label, "error", err)
+				continue
+			}
+
+			// Use per-mount thresholds if configured, otherwise use global
+			mountMonitor := d.monitor
+			if mount.ThresholdWarning > 0 || mount.ThresholdCritical > 0 {
+				warning := d.config.Thresholds.Warning
+				moderate := d.config.Thresholds.Moderate
+				aggressive := d.config.Thresholds.Aggressive
+				critical := d.config.Thresholds.Critical
+				if mount.ThresholdWarning > 0 {
+					warning = mount.ThresholdWarning
+				}
+				if mount.ThresholdCritical > 0 {
+					critical = mount.ThresholdCritical
+				}
+				mountMonitor = monitor.NewDiskMonitor(warning, moderate, aggressive, critical)
+			}
+
+			mountLevel := mountMonitor.CheckLevel(stats)
+			label := mount.Label
+			if label == "" {
+				label = mount.Path
+			}
+
+			d.logger.Info("disk status",
+				"mount", label,
+				"path", mount.Path,
+				"used_percent", fmt.Sprintf("%.1f%%", stats.UsedPercent),
+				"free_gb", fmt.Sprintf("%.1fGB", stats.FreeGB),
+				"level", mountLevel.String(),
+			)
+
+			if mountLevel > highestLevel {
+				highestLevel = mountLevel
+			}
+		}
+	} else {
+		// Fallback: monitor home directory (original behavior)
+		// On macOS, "/" is the sealed system volume, but user data is on /System/Volumes/Data
+		// Using $HOME ensures we monitor the volume where data actually lives
+		monitorPath := "/"
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			monitorPath = home
+		}
+
+		stats, detectedLevel, err := d.monitor.Check(monitorPath)
+		if err != nil {
+			d.logger.Error("failed to check disk", "error", err)
+			return monitor.LevelNone
+		}
+
+		d.logger.Info("disk status",
+			"used_percent", fmt.Sprintf("%.1f%%", stats.UsedPercent),
+			"free_gb", fmt.Sprintf("%.1fGB", stats.FreeGB),
+			"level", detectedLevel.String(),
+		)
+
+		highestLevel = detectedLevel
+	}
+
+	return highestLevel
+}
+
 func registerPlugins(registry *plugins.Registry) {
 	// Core plugins (all platforms)
 	registry.Register(plugins.NewDockerPlugin())
@@ -272,6 +330,8 @@ func registerPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewNixPlugin())
 	registry.Register(plugins.NewCachePlugin())
 	registry.Register(plugins.NewGitLabRunnerPlugin())
+	registry.Register(plugins.NewGitHubRunnerPlugin())
+	registry.Register(plugins.NewYumPlugin())
 
 	// Kubernetes plugins (disabled by default, for future use)
 	registry.Register(plugins.NewEtcdPlugin())

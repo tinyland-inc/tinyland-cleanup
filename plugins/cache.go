@@ -87,19 +87,55 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 			sizeBefore := getDirSize(cargoCache)
 			deleteOldFiles(cargoCache, 30*24*time.Hour)
 			sizeAfter := getDirSize(cargoCache)
-			result.BytesFreed += sizeBefore - sizeAfter
+			result.BytesFreed += safeBytesDiff(sizeBefore, sizeAfter)
 		}
 	}
 
-	// Temp files
-	if level >= LevelWarning {
-		tmpFiles := []string{"/tmp", "/var/tmp"}
-		for _, tmpDir := range tmpFiles {
-			sizeBefore := getDirSize(tmpDir)
-			deleteOldFilesOwnedByUser(tmpDir, 7*24*time.Hour)
-			sizeAfter := getDirSize(tmpDir)
-			result.BytesFreed += sizeBefore - sizeAfter
+	// Maven cache (moderate+)
+	if level >= LevelModerate {
+		mavenCache := filepath.Join(home, ".m2", "repository")
+		if size := getDirSize(mavenCache); size > 0 {
+			sizeBefore := size
+			deleteOldFiles(mavenCache, 30*24*time.Hour)
+			sizeAfter := getDirSize(mavenCache)
+			freed := safeBytesDiff(sizeBefore, sizeAfter)
+			result.BytesFreed += freed
+			logger.Debug("cleaned maven cache", "freed_mb", freed/(1024*1024))
 		}
+	}
+
+	// Gradle cache (moderate+)
+	if level >= LevelModerate {
+		gradleCache := filepath.Join(home, ".gradle", "caches")
+		if size := getDirSize(gradleCache); size > 0 {
+			sizeBefore := size
+			deleteOldFiles(gradleCache, 30*24*time.Hour)
+			sizeAfter := getDirSize(gradleCache)
+			freed := safeBytesDiff(sizeBefore, sizeAfter)
+			result.BytesFreed += freed
+			logger.Debug("cleaned gradle cache", "freed_mb", freed/(1024*1024))
+		}
+	}
+
+	// Temp files - more aggressive cleanup based on level
+	// Uses mount-boundary-safe deletion and tracks actual bytes freed
+	tmpFiles := []string{"/tmp", "/var/tmp"}
+	for _, tmpDir := range tmpFiles {
+		if !pathExistsAndIsDir(tmpDir) {
+			continue
+		}
+		var maxAge time.Duration
+		switch {
+		case level >= LevelAggressive:
+			maxAge = 1 * 24 * time.Hour // 1 day at aggressive
+		case level >= LevelModerate:
+			maxAge = 3 * 24 * time.Hour // 3 days at moderate
+		default:
+			maxAge = 7 * 24 * time.Hour // 7 days at warning
+		}
+		// Use mount-safe version that returns actual freed bytes
+		freed := deleteOldFilesOwnedByUserSameDevice(tmpDir, maxAge)
+		result.BytesFreed += freed
 	}
 
 	// Systemd journal (Linux only)
