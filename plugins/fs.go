@@ -16,7 +16,7 @@ func deviceID(path string) (uint64, error) {
 	if err := syscall.Stat(path, &stat); err != nil {
 		return 0, err
 	}
-	return stat.Dev, nil
+	return uint64(stat.Dev), nil
 }
 
 // getDirSizeSameDevice calculates directory size without crossing mount boundaries.
