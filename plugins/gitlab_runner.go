@@ -193,7 +193,7 @@ func (p *GitLabRunnerPlugin) cleanBuildDirectories(ctx context.Context, runnerPa
 func (p *GitLabRunnerPlugin) cleanDockerCaches(ctx context.Context, logger *slog.Logger, result CleanupResult) CleanupResult {
 	// Clean gitlab-runner docker cache volumes
 	cmd := exec.CommandContext(ctx, "docker", "volume", "ls", "--filter", "name=runner-", "-q")
-	output, err := cmd.Output()
+	output, err := safeOutput(cmd)
 	if err != nil {
 		return result
 	}

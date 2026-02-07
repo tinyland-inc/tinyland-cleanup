@@ -93,7 +93,7 @@ func (p *NixPlugin) collectGarbage(ctx context.Context, deleteOldGenerations boo
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nix-collect-garbage", args...)
-	output, err := cmd.CombinedOutput()
+	output, err := safeCombinedOutput(cmd)
 	if err != nil {
 		result.Error = err
 		return result
@@ -124,7 +124,7 @@ func (p *NixPlugin) collectGarbageCritical(ctx context.Context, logger *slog.Log
 	defer cancel()
 
 	cmd := exec.CommandContext(optimizeCtx, "nix-store", "--optimize")
-	output, err := cmd.CombinedOutput()
+	output, err := safeCombinedOutput(cmd)
 	if err != nil {
 		logger.Error("nix-store --optimize failed", "error", err, "output", string(output))
 		// Don't fail the whole operation for optimize failure

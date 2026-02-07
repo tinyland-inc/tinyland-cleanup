@@ -505,7 +505,7 @@ func (p *DevArtifactsPlugin) findArtifactDirs(scanPath string, targetName string
 // getGoCacheDir returns the Go build cache directory.
 func (p *DevArtifactsPlugin) getGoCacheDir(ctx context.Context) string {
 	cmd := exec.CommandContext(ctx, "go", "env", "GOCACHE")
-	output, err := cmd.Output()
+	output, err := safeOutput(cmd)
 	if err != nil {
 		return ""
 	}

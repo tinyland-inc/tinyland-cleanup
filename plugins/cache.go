@@ -74,7 +74,7 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 	// Go build cache (moderate+, separate from module cache)
 	if level >= LevelModerate {
 		if _, err := exec.LookPath("go"); err == nil {
-			if output, err := exec.CommandContext(ctx, "go", "env", "GOCACHE").Output(); err == nil {
+			if output, err := safeOutput(exec.CommandContext(ctx, "go", "env", "GOCACHE")); err == nil {
 				goCacheDir := strings.TrimSpace(string(output))
 				if goCacheDir != "" && goCacheDir != "off" {
 					sizeBefore := getDirSize(goCacheDir)
@@ -126,7 +126,7 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 	if level >= LevelCritical {
 		if _, err := exec.LookPath("rustup"); err == nil {
 			// Remove all non-default toolchains
-			output, err := exec.CommandContext(ctx, "rustup", "toolchain", "list").Output()
+			output, err := safeOutput(exec.CommandContext(ctx, "rustup", "toolchain", "list"))
 			if err == nil {
 				for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 					line = strings.TrimSpace(line)

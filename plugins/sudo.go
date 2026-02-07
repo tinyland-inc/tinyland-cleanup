@@ -55,7 +55,7 @@ func DetectSudo(ctx context.Context) SudoCapability {
 func RunWithSudo(ctx context.Context, args ...string) ([]byte, error) {
 	cmdArgs := append([]string{"-n"}, args...)
 	cmd := exec.CommandContext(ctx, "sudo", cmdArgs...)
-	return cmd.CombinedOutput()
+	return safeCombinedOutput(cmd)
 }
 
 // HasGroup checks if the current user is in the specified group.

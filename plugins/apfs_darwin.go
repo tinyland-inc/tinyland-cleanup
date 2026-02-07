@@ -155,7 +155,7 @@ type snapshotInfo struct {
 // listSnapshots lists all local APFS snapshots.
 func (p *APFSPlugin) listSnapshots(ctx context.Context) ([]snapshotInfo, error) {
 	cmd := exec.CommandContext(ctx, "tmutil", "listlocalsnapshots", "/")
-	output, err := cmd.Output()
+	output, err := safeOutput(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("tmutil listlocalsnapshots failed: %w", err)
 	}
@@ -303,7 +303,7 @@ func (p *APFSPlugin) deleteOldSnapshots(ctx context.Context, snapshots []snapsho
 // isBackupActive checks if a Time Machine backup is currently running.
 func (p *APFSPlugin) isBackupActive(ctx context.Context) bool {
 	cmd := exec.CommandContext(ctx, "tmutil", "status")
-	output, err := cmd.Output()
+	output, err := safeOutput(cmd)
 	if err != nil {
 		return false // Assume not active if we can't check
 	}

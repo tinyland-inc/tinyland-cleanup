@@ -242,7 +242,7 @@ func (p *EtcdPlugin) getEtcdDiskUsage() int {
 	// Get the mount point for etcd data dir and check its usage
 	// Use default data dir until cfg.Etcd is implemented
 	cmd := exec.Command("df", defaultEtcdDataDir)
-	output, err := cmd.Output()
+	output, err := safeOutput(cmd)
 	if err != nil {
 		return 0
 	}
@@ -297,7 +297,7 @@ func (p *EtcdPlugin) runDefrag(ctx context.Context, logger *slog.Logger) {
 	cmd.Env = append(os.Environ(), env...)
 
 	logger.Debug("running etcd defrag")
-	if output, err := cmd.CombinedOutput(); err != nil {
+	if output, err := safeCombinedOutput(cmd); err != nil {
 		logger.Debug("etcd defrag failed", "error", err, "output", string(output))
 	} else {
 		logger.Info("etcd defrag completed successfully")
@@ -334,7 +334,7 @@ func (p *EtcdPlugin) compactDatabase(ctx context.Context, logger *slog.Logger) {
 	// Get current revision
 	cmd := exec.CommandContext(ctx, etcdctl, "endpoint", "status", "--endpoints=https://127.0.0.1:2379", "--write-out=json")
 	cmd.Env = append(os.Environ(), env...)
-	output, err := cmd.Output()
+	output, err := safeOutput(cmd)
 	if err != nil {
 		logger.Debug("failed to get etcd status", "error", err)
 		return
