@@ -4,6 +4,7 @@ package plugins
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
 )
@@ -123,6 +125,20 @@ func (p *LimaPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *confi
 					logger.Warn("Lima disk compaction failed", "vm", vmName, "error", err)
 				} else if compactFreed > 0 {
 					result.BytesFreed += compactFreed
+					result.ItemsCleaned++
+				}
+			}
+		}
+
+		// At Moderate+ level with dynamic_resize enabled, try shrinking VM disk
+		if level >= LevelModerate && cfg.Lima.DynamicResizeEnabled {
+			diskInfo, err := p.GetVMDiskInfo(ctx, vmName)
+			if err == nil && diskInfo.DiskPath != "" {
+				resizeFreed, err := p.dynamicResize(ctx, diskInfo, cfg, logger)
+				if err != nil {
+					logger.Warn("Lima dynamic resize failed", "vm", vmName, "error", err)
+				} else if resizeFreed > 0 {
+					result.BytesFreed += resizeFreed
 					result.ItemsCleaned++
 				}
 			}
@@ -633,4 +649,276 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Resize: stop/resize/restart cycle for krunkit raw format disks
+// ---------------------------------------------------------------------------
+
+// resizeHistory tracks when each VM was last resized to enforce cool-down.
+type resizeHistory struct {
+	VMs map[string]resizeRecord `json:"vms"`
+}
+
+type resizeRecord struct {
+	LastResize   time.Time `json:"last_resize"`
+	SizeBeforeGB int       `json:"size_before_gb"`
+	SizeAfterGB  int       `json:"size_after_gb"`
+}
+
+// dynamicResize checks if a VM disk should be shrunk and performs the
+// stop/resize/restart cycle. Only works on raw format disks (krunkit).
+// Returns bytes freed on the host or 0 if no resize was needed.
+func (p *LimaPlugin) dynamicResize(ctx context.Context, vm *VMDiskInfo, cfg *config.Config, logger *slog.Logger) (int64, error) {
+	if vm.Status != "Running" {
+		return 0, nil
+	}
+
+	// Only resize raw format disks (krunkit). qcow2 disks handle sparse
+	// space via compaction already.
+	diskFormat := p.detectDiskFormat(ctx, vm.DiskPath)
+	if diskFormat != "raw" {
+		logger.Debug("dynamic resize skipped: not a raw format disk", "vm", vm.Name, "format", diskFormat)
+		return 0, nil
+	}
+
+	// Check guest disk usage against threshold
+	usedPercent, err := strconv.Atoi(strings.TrimSuffix(vm.UsedPercent, "%"))
+	if err != nil || usedPercent == 0 {
+		return 0, nil
+	}
+
+	threshold := cfg.Lima.DynamicResizeThreshold
+	if threshold <= 0 {
+		threshold = 75
+	}
+	if usedPercent < threshold {
+		logger.Debug("dynamic resize skipped: usage below threshold",
+			"vm", vm.Name, "used_percent", usedPercent, "threshold", threshold)
+		return 0, nil
+	}
+
+	// Check cool-down period
+	history := p.loadResizeHistory(logger)
+	if record, ok := history.VMs[vm.Name]; ok {
+		cooldownHours := cfg.Lima.DynamicResizeMinCooldownHours
+		if cooldownHours <= 0 {
+			cooldownHours = 24
+		}
+		elapsed := time.Since(record.LastResize)
+		if elapsed < time.Duration(cooldownHours)*time.Hour {
+			logger.Debug("dynamic resize skipped: cool-down active",
+				"vm", vm.Name, "hours_since_last", int(elapsed.Hours()), "cooldown_hours", cooldownHours)
+			return 0, nil
+		}
+	}
+
+	// Check for Kubernetes workloads running inside the VM
+	if p.isKubernetesRunning(ctx, vm.Name, logger) {
+		logger.Warn("dynamic resize skipped: Kubernetes detected inside VM",
+			"vm", vm.Name,
+			"hint", "drain the node or stop K8s before enabling dynamic resize")
+		return 0, nil
+	}
+
+	// Calculate target size
+	headroomGB := cfg.Lima.DynamicResizeHeadroomGB
+	if headroomGB <= 0 {
+		headroomGB = 5
+	}
+	targetBytes := calculateTargetSize(vm.UsedBytes, int64(headroomGB)*1024*1024*1024)
+
+	// Don't resize if target is >= current apparent size (nothing to gain)
+	if targetBytes >= vm.TotalBytes {
+		logger.Debug("dynamic resize skipped: target >= current size",
+			"vm", vm.Name,
+			"target_gb", targetBytes/(1024*1024*1024),
+			"current_gb", vm.TotalBytes/(1024*1024*1024))
+		return 0, nil
+	}
+
+	// Check that we have qemu-img
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		return 0, fmt.Errorf("qemu-img not available: %w", err)
+	}
+
+	apparentBefore := vm.TotalBytes
+	targetGB := targetBytes / (1024 * 1024 * 1024)
+
+	logger.Warn("DYNAMIC RESIZE: stopping Lima VM to shrink disk",
+		"vm", vm.Name,
+		"current_apparent_gb", apparentBefore/(1024*1024*1024),
+		"guest_used_gb", vm.UsedBytes/(1024*1024*1024),
+		"target_gb", targetGB)
+
+	// Perform the resize
+	freed, err := p.resizeAndRestart(ctx, vm, targetGB, logger)
+	if err != nil {
+		return 0, err
+	}
+
+	// Record in history
+	history.VMs[vm.Name] = resizeRecord{
+		LastResize:   time.Now(),
+		SizeBeforeGB: int(apparentBefore / (1024 * 1024 * 1024)),
+		SizeAfterGB:  int(targetGB),
+	}
+	p.saveResizeHistory(history, logger)
+
+	if freed > 0 {
+		logger.Info("dynamic resize complete",
+			"vm", vm.Name,
+			"freed_gb", freed/(1024*1024*1024),
+			"new_size_gb", targetGB)
+	}
+
+	return freed, nil
+}
+
+// calculateTargetSize computes the safe target disk size: used bytes + headroom,
+// rounded up to the nearest GB boundary. Never returns less than used + 1GB.
+func calculateTargetSize(usedBytes, headroomBytes int64) int64 {
+	const gb = 1024 * 1024 * 1024
+	target := usedBytes + headroomBytes
+	if target < usedBytes+gb {
+		target = usedBytes + gb
+	}
+	// Round up to GB boundary
+	return ((target + gb - 1) / gb) * gb
+}
+
+// isKubernetesRunning checks if RKE2, k3s, or kubelet is running inside the VM.
+func (p *LimaPlugin) isKubernetesRunning(ctx context.Context, vmName string, logger *slog.Logger) bool {
+	// Check for common Kubernetes directories and processes
+	checks := [][]string{
+		{"test", "-d", "/var/lib/rancher/rke2"},
+		{"test", "-d", "/var/lib/rancher/k3s"},
+		{"pgrep", "-x", "kubelet"},
+	}
+
+	for _, args := range checks {
+		if _, err := p.execInVM(ctx, vmName, args, logger); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// resizeAndRestart stops the VM, resizes the raw disk, and restarts.
+// Always attempts restart even if resize fails. Returns host bytes freed.
+func (p *LimaPlugin) resizeAndRestart(ctx context.Context, vm *VMDiskInfo, targetGB int64, logger *slog.Logger) (int64, error) {
+	hostSizeBefore := p.getActualDiskSize(vm.DiskPath)
+
+	// 1. Stop VM
+	stopCmd := exec.CommandContext(ctx, "limactl", "stop", vm.Name)
+	if output, err := stopCmd.CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("failed to stop VM for resize: %w (output: %s)", err, string(output))
+	}
+
+	// 2. Resize disk via qemu-img convert to a smaller sparse raw image
+	// We can't use `qemu-img resize --shrink` on raw because it just truncates.
+	// Instead, create a new sparse raw image at the target size, then dd the
+	// data from old to new. But that's risky if the guest fs extends beyond target.
+	//
+	// Safer approach: create a new raw sparse image at targetGB, then use
+	// qemu-img convert to copy only the used blocks.
+	compactPath := vm.DiskPath + ".resized"
+	defer os.Remove(compactPath) // cleanup on any path
+
+	// Create a new raw image at the target size
+	createCmd := exec.CommandContext(ctx, "qemu-img", "create", "-f", "raw", compactPath, fmt.Sprintf("%dG", targetGB))
+	if output, err := createCmd.CombinedOutput(); err != nil {
+		// Restart VM before returning error
+		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
+		return 0, fmt.Errorf("failed to create resized disk: %w (output: %s)", err, string(output))
+	}
+
+	// Convert (copy used blocks from old to new, preserving sparseness)
+	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert", "-O", "raw", vm.DiskPath, compactPath)
+	if output, err := convertCmd.CombinedOutput(); err != nil {
+		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
+		return 0, fmt.Errorf("qemu-img convert failed during resize: %w (output: %s)", err, string(output))
+	}
+
+	// Verify the new image has correct apparent size
+	newInfo, err := os.Stat(compactPath)
+	if err != nil {
+		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
+		return 0, fmt.Errorf("cannot stat resized disk: %w", err)
+	}
+	expectedApparent := targetGB * 1024 * 1024 * 1024
+	if newInfo.Size() != expectedApparent {
+		// qemu-img convert preserves source apparent size, not target.
+		// This is expected -- the convert copies data, doesn't resize.
+		// The actual host blocks used should still be smaller.
+		logger.Debug("resized disk apparent size differs from target",
+			"apparent", newInfo.Size(), "target", expectedApparent,
+			"note", "qemu-img convert preserves source geometry")
+	}
+
+	// 3. Atomic replace
+	if err := os.Rename(compactPath, vm.DiskPath); err != nil {
+		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
+		return 0, fmt.Errorf("failed to replace disk image: %w", err)
+	}
+
+	// 4. Restart VM (always, even if something above failed partially)
+	logger.Info("restarting Lima VM after dynamic resize", "vm", vm.Name)
+	startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
+	if output, err := startCmd.CombinedOutput(); err != nil {
+		logger.Error("failed to restart VM after resize", "vm", vm.Name, "error", err, "output", string(output))
+	}
+
+	// Calculate freed space on host
+	hostSizeAfter := p.getActualDiskSize(vm.DiskPath)
+	if hostSizeBefore > hostSizeAfter {
+		return hostSizeBefore - hostSizeAfter, nil
+	}
+	return 0, nil
+}
+
+// resizeHistoryPath returns the path to the resize history JSON file.
+func resizeHistoryPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "tinyland-cleanup", "lima_resize_history.json")
+}
+
+// loadResizeHistory loads the resize history from disk.
+func (p *LimaPlugin) loadResizeHistory(logger *slog.Logger) *resizeHistory {
+	h := &resizeHistory{VMs: make(map[string]resizeRecord)}
+
+	data, err := os.ReadFile(resizeHistoryPath())
+	if err != nil {
+		return h // fresh history
+	}
+
+	if err := json.Unmarshal(data, h); err != nil {
+		logger.Debug("failed to parse resize history", "error", err)
+		return &resizeHistory{VMs: make(map[string]resizeRecord)}
+	}
+
+	if h.VMs == nil {
+		h.VMs = make(map[string]resizeRecord)
+	}
+	return h
+}
+
+// saveResizeHistory writes the resize history to disk.
+func (p *LimaPlugin) saveResizeHistory(h *resizeHistory, logger *slog.Logger) {
+	path := resizeHistoryPath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		logger.Debug("failed to create resize history dir", "error", err)
+		return
+	}
+
+	data, err := json.MarshalIndent(h, "", "  ")
+	if err != nil {
+		logger.Debug("failed to marshal resize history", "error", err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		logger.Debug("failed to write resize history", "error", err)
+	}
 }

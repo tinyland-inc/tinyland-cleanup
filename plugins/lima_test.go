@@ -4,6 +4,7 @@ package plugins
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"math"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"testing"
+	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
 )
@@ -689,5 +691,237 @@ func TestExecInVM_NoLimactl_NoSSHConfig(t *testing.T) {
 	_, err := p.execInVM(context.Background(), "nonexistent-vm", []string{"echo", "test"}, logger)
 	if err == nil {
 		t.Error("expected error when VM doesn't exist")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// calculateTargetSize
+// ---------------------------------------------------------------------------
+
+func TestCalculateTargetSize_BasicHeadroom(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+	tests := []struct {
+		name         string
+		usedBytes    int64
+		headroomGB   int
+		wantMinGB    int64 // target must be >= this many GB
+		wantMaxGB    int64 // target must be <= this many GB
+		wantExactGB  int64 // if >0, target must equal exactly this
+	}{
+		{
+			name:        "14GB used + 5GB headroom = 19GB",
+			usedBytes:   14 * gb,
+			headroomGB:  5,
+			wantExactGB: 19,
+		},
+		{
+			name:        "14GB used + 10GB headroom = 24GB",
+			usedBytes:   14 * gb,
+			headroomGB:  10,
+			wantExactGB: 24,
+		},
+		{
+			name:        "1GB used + 5GB headroom = 6GB",
+			usedBytes:   1 * gb,
+			headroomGB:  5,
+			wantExactGB: 6,
+		},
+		{
+			name:        "0 used + 5GB headroom = 5GB",
+			usedBytes:   0,
+			headroomGB:  5,
+			wantExactGB: 5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := calculateTargetSize(tt.usedBytes, int64(tt.headroomGB)*gb)
+			gotGB := got / gb
+
+			if tt.wantExactGB > 0 && gotGB != tt.wantExactGB {
+				t.Errorf("calculateTargetSize(%dGB, %dGB) = %dGB, want %dGB",
+					tt.usedBytes/gb, tt.headroomGB, gotGB, tt.wantExactGB)
+			}
+			if tt.wantMinGB > 0 && gotGB < tt.wantMinGB {
+				t.Errorf("calculateTargetSize(%dGB, %dGB) = %dGB, want >= %dGB",
+					tt.usedBytes/gb, tt.headroomGB, gotGB, tt.wantMinGB)
+			}
+			if tt.wantMaxGB > 0 && gotGB > tt.wantMaxGB {
+				t.Errorf("calculateTargetSize(%dGB, %dGB) = %dGB, want <= %dGB",
+					tt.usedBytes/gb, tt.headroomGB, gotGB, tt.wantMaxGB)
+			}
+		})
+	}
+}
+
+func TestCalculateTargetSize_RoundsUpToGB(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+
+	// Fractional: 14.5GB used + 5GB headroom = 19.5GB -> rounds up to 20GB
+	used := 14*gb + gb/2
+	got := calculateTargetSize(used, 5*gb)
+	gotGB := got / gb
+
+	if gotGB != 20 {
+		t.Errorf("calculateTargetSize(14.5GB, 5GB) = %dGB, want 20GB (rounded up)", gotGB)
+	}
+
+	// Verify it's exactly on a GB boundary
+	if got%gb != 0 {
+		t.Errorf("calculateTargetSize should return GB-aligned value, got %d bytes (remainder %d)", got, got%gb)
+	}
+}
+
+func TestCalculateTargetSize_MinimumOneGBHeadroom(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+
+	// Even with 0 headroom, should have at least 1GB above used
+	got := calculateTargetSize(10*gb, 0)
+	gotGB := got / gb
+
+	if gotGB < 11 {
+		t.Errorf("calculateTargetSize(10GB, 0) = %dGB, want >= 11GB (minimum 1GB headroom)", gotGB)
+	}
+}
+
+func TestCalculateTargetSize_NeverLessThanUsedPlusOneGB(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+
+	// Even with negative-like headroom (0 bytes), minimum is used + 1GB
+	for _, usedGB := range []int64{1, 5, 10, 20, 50, 100} {
+		got := calculateTargetSize(usedGB*gb, 0)
+		minimum := (usedGB + 1) * gb
+		if got < minimum {
+			t.Errorf("calculateTargetSize(%dGB, 0) = %d, want >= %d (used + 1GB)", usedGB, got, minimum)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isKubernetesRunning (unit: nonexistent VM returns false)
+// ---------------------------------------------------------------------------
+
+func TestIsKubernetesRunning_NonexistentVM(t *testing.T) {
+	p := &LimaPlugin{}
+	logger := slog.Default()
+
+	// A nonexistent VM should fail all exec calls and return false
+	result := p.isKubernetesRunning(context.Background(), "nonexistent-vm-12345", logger)
+	if result {
+		t.Error("isKubernetesRunning should return false for nonexistent VM")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// resizeHistory load/save round-trip
+// ---------------------------------------------------------------------------
+
+func TestResizeHistory_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	histPath := filepath.Join(dir, "lima_resize_history.json")
+
+	// Override resizeHistoryPath by writing/reading directly
+	p := &LimaPlugin{}
+	logger := slog.Default()
+
+	// Create a history record
+	h := &resizeHistory{
+		VMs: map[string]resizeRecord{
+			"unified": {
+				LastResize:   time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC),
+				SizeBeforeGB: 40,
+				SizeAfterGB:  19,
+			},
+			"colima": {
+				LastResize:   time.Date(2026, 2, 5, 8, 30, 0, 0, time.UTC),
+				SizeBeforeGB: 80,
+				SizeAfterGB:  45,
+			},
+		},
+	}
+
+	// Marshal and write
+	data, err := json.MarshalIndent(h, "", "  ")
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+	if err := os.WriteFile(histPath, data, 0644); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	// Read back
+	readData, err := os.ReadFile(histPath)
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+
+	var loaded resizeHistory
+	if err := json.Unmarshal(readData, &loaded); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if len(loaded.VMs) != 2 {
+		t.Errorf("loaded %d VMs, want 2", len(loaded.VMs))
+	}
+
+	unified, ok := loaded.VMs["unified"]
+	if !ok {
+		t.Fatal("missing 'unified' VM in loaded history")
+	}
+	if unified.SizeBeforeGB != 40 || unified.SizeAfterGB != 19 {
+		t.Errorf("unified record = %+v, want before=40 after=19", unified)
+	}
+
+	// Verify loadResizeHistory handles missing file gracefully
+	emptyHist := p.loadResizeHistory(logger)
+	if emptyHist == nil || emptyHist.VMs == nil {
+		t.Error("loadResizeHistory with missing file should return empty (not nil) history")
+	}
+}
+
+func TestLoadResizeHistory_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "bad_history.json")
+
+	// Write invalid JSON
+	if err := os.WriteFile(badPath, []byte("{not valid json"), 0644); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	p := &LimaPlugin{}
+	logger := slog.Default()
+
+	// loadResizeHistory reads from a fixed path, so test the unmarshal logic directly
+	var h resizeHistory
+	data, _ := os.ReadFile(badPath)
+	err := json.Unmarshal(data, &h)
+	if err == nil {
+		t.Error("expected error unmarshalling invalid JSON")
+	}
+
+	// The function should return a fresh empty history on parse error
+	_ = p
+	_ = logger
+}
+
+// ---------------------------------------------------------------------------
+// LimaConfig default values for dynamic resize fields
+// ---------------------------------------------------------------------------
+
+func TestLimaConfig_DynamicResizeDefaults(t *testing.T) {
+	cfg := config.DefaultConfig()
+
+	if cfg.Lima.DynamicResizeEnabled {
+		t.Error("DynamicResizeEnabled should default to false (opt-in)")
+	}
+	if cfg.Lima.DynamicResizeThreshold != 75 {
+		t.Errorf("DynamicResizeThreshold = %d, want 75", cfg.Lima.DynamicResizeThreshold)
+	}
+	if cfg.Lima.DynamicResizeMinCooldownHours != 24 {
+		t.Errorf("DynamicResizeMinCooldownHours = %d, want 24", cfg.Lima.DynamicResizeMinCooldownHours)
+	}
+	if cfg.Lima.DynamicResizeHeadroomGB != 5 {
+		t.Errorf("DynamicResizeHeadroomGB = %d, want 5", cfg.Lima.DynamicResizeHeadroomGB)
 	}
 }

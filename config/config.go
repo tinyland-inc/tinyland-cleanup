@@ -134,6 +134,15 @@ type LimaConfig struct {
 	VMNames []string `yaml:"vm_names"`
 	// CompactOffline enables offline qcow2 compaction at Critical level
 	CompactOffline bool `yaml:"compact_offline"`
+	// DynamicResizeEnabled enables stop/resize/restart cycle to shrink VM disks
+	// Only works with raw format disks (krunkit). Requires VM downtime.
+	DynamicResizeEnabled bool `yaml:"dynamic_resize_enabled"`
+	// DynamicResizeThreshold is the guest disk usage % that triggers resize (default: 75)
+	DynamicResizeThreshold int `yaml:"dynamic_resize_threshold"`
+	// DynamicResizeMinCooldownHours is the minimum hours between resize operations (default: 24)
+	DynamicResizeMinCooldownHours int `yaml:"dynamic_resize_min_cooldown_hours"`
+	// DynamicResizeHeadroomGB is GB of free space to preserve after resize (default: 5)
+	DynamicResizeHeadroomGB int `yaml:"dynamic_resize_headroom_gb"`
 }
 
 // PodmanConfig holds Podman-specific cleanup settings.
@@ -246,7 +255,10 @@ func DefaultConfig() *Config {
 			TrimVMDisk:               true,
 		},
 		Lima: LimaConfig{
-			VMNames: []string{"colima", "unified"},
+			VMNames:                       []string{"colima", "unified"},
+			DynamicResizeThreshold:        75,
+			DynamicResizeMinCooldownHours: 24,
+			DynamicResizeHeadroomGB:       5,
 		},
 		ICloud: ICloudConfig{
 			EvictAfterDays: 30,
