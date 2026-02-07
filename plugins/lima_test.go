@@ -3,6 +3,8 @@
 package plugins
 
 import (
+	"context"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -624,4 +626,68 @@ func TestGetActualDiskSize_NotApparentSize(t *testing.T) {
 	}
 
 	t.Logf("apparent=%d actual=%d (block-aligned)", apparent, actual)
+}
+
+// ---------------------------------------------------------------------------
+// detectDiskFormat
+// ---------------------------------------------------------------------------
+
+func TestDetectDiskFormat_RawFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "diffdisk")
+
+	// Create a file with a DOS/MBR-like header (not qcow2 magic)
+	data := make([]byte, 4096)
+	data[0] = 0x00 // Not QFI\xfb
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	p := &LimaPlugin{}
+	format := p.detectDiskFormat(context.Background(), path)
+	if format != "raw" {
+		t.Errorf("detectDiskFormat = %q, want %q for non-qcow2 file", format, "raw")
+	}
+}
+
+func TestDetectDiskFormat_Qcow2Magic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "diffdisk")
+
+	// Create a file with qcow2 magic bytes: QFI\xfb
+	data := make([]byte, 4096)
+	copy(data[:4], []byte("QFI\xfb"))
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	p := &LimaPlugin{}
+	// If qemu-img is not available, should fall back to magic byte detection
+	format := p.detectDiskFormat(context.Background(), path)
+	// qemu-img may or may not be installed; either way should detect qcow2
+	if format != "qcow2" {
+		t.Errorf("detectDiskFormat = %q, want %q for qcow2 magic", format, "qcow2")
+	}
+}
+
+func TestDetectDiskFormat_NonexistentFile(t *testing.T) {
+	p := &LimaPlugin{}
+	format := p.detectDiskFormat(context.Background(), "/nonexistent/path/diffdisk")
+	if format != "raw" {
+		t.Errorf("detectDiskFormat = %q, want %q for nonexistent file", format, "raw")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// execInVM (unit-level: SSH config detection)
+// ---------------------------------------------------------------------------
+
+func TestExecInVM_NoLimactl_NoSSHConfig(t *testing.T) {
+	// When both limactl shell and SSH config are missing, should return error
+	p := &LimaPlugin{}
+	logger := slog.Default()
+	_, err := p.execInVM(context.Background(), "nonexistent-vm", []string{"echo", "test"}, logger)
+	if err == nil {
+		t.Error("expected error when VM doesn't exist")
+	}
 }

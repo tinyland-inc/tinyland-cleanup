@@ -18,12 +18,12 @@ import (
 )
 
 // LimaPlugin handles Lima VM cleanup and disk resize operations.
-// Lima VMs use sparse qcow2 disk images that grow automatically but don't
-// shrink when data is deleted. This plugin:
+// Lima VMs use sparse disk images (qcow2 or raw depending on VM type) that
+// grow automatically but don't shrink when data is deleted. This plugin:
 // - Cleans Docker/Podman containers inside VMs
-// - Runs fstrim to reclaim space in the disk image
-// - Monitors disk usage and triggers resize when needed
-// - Supports additional disks with limactl disk resize
+// - Runs fstrim to reclaim space in the disk image (qemu/vz only)
+// - Performs offline disk compaction to reclaim sparse space
+// - Supports krunkit VMs via SSH fallback (limactl shell crashes on krunkit)
 type LimaPlugin struct{}
 
 // NewLimaPlugin creates a new Lima VM cleanup plugin.
@@ -159,6 +159,85 @@ func (p *LimaPlugin) getRunningVMs(ctx context.Context) ([]string, error) {
 	return running, nil
 }
 
+// execInVM runs a command inside a Lima VM. It tries limactl shell first,
+// falling back to SSH via the VM's ssh.config when limactl shell fails
+// (which happens with krunkit VMs on Lima < 1.1).
+func (p *LimaPlugin) execInVM(ctx context.Context, vmName string, args []string, logger *slog.Logger) ([]byte, error) {
+	// Try limactl shell first
+	cmdArgs := append([]string{"shell", vmName, "--"}, args...)
+	cmd := exec.CommandContext(ctx, "limactl", cmdArgs...)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return output, nil
+	}
+
+	// If limactl shell crashed (e.g. krunkit "Unknown driver" panic),
+	// fall back to SSH via the VM's ssh.config
+	home, homeErr := os.UserHomeDir()
+	if homeErr != nil {
+		return output, fmt.Errorf("limactl shell failed and cannot determine home dir: %w", err)
+	}
+
+	sshConfig := filepath.Join(home, ".lima", vmName, "ssh.config")
+	if _, statErr := os.Stat(sshConfig); statErr != nil {
+		return output, fmt.Errorf("limactl shell failed and no ssh.config found: %w", err)
+	}
+
+	sshHost := "lima-" + vmName
+	sshArgs := []string{
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "LogLevel=ERROR",
+		"-F", sshConfig,
+		sshHost,
+	}
+	sshArgs = append(sshArgs, strings.Join(args, " "))
+	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
+	sshOutput, sshErr := sshCmd.CombinedOutput()
+	if sshErr != nil {
+		logger.Debug("SSH fallback also failed", "vm", vmName, "error", sshErr)
+		return sshOutput, fmt.Errorf("both limactl shell and SSH failed: shell=%w, ssh=%v", err, sshErr)
+	}
+
+	logger.Debug("used SSH fallback for VM command", "vm", vmName, "cmd", strings.Join(args, " "))
+	return sshOutput, nil
+}
+
+// detectDiskFormat returns the disk image format ("raw" or "qcow2") by
+// inspecting the file with qemu-img info. Falls back to checking magic bytes.
+func (p *LimaPlugin) detectDiskFormat(ctx context.Context, diskPath string) string {
+	// Try qemu-img info first
+	cmd := exec.CommandContext(ctx, "qemu-img", "info", "--output=json", diskPath)
+	output, err := cmd.Output()
+	if err == nil {
+		outStr := string(output)
+		if strings.Contains(outStr, `"format": "qcow2"`) {
+			return "qcow2"
+		}
+		if strings.Contains(outStr, `"format": "raw"`) {
+			return "raw"
+		}
+	}
+
+	// Fallback: check file magic bytes
+	f, err := os.Open(diskPath)
+	if err != nil {
+		return "raw" // default to raw (safer — preserves format)
+	}
+	defer f.Close()
+
+	magic := make([]byte, 4)
+	if _, err := f.Read(magic); err != nil {
+		return "raw"
+	}
+	// QFI\xfb is the qcow2 magic
+	if string(magic) == "QFI\xfb" {
+		return "qcow2"
+	}
+
+	return "raw"
+}
+
 func (p *LimaPlugin) cleanupVM(ctx context.Context, vmName string, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name() + "-" + vmName}
 
@@ -197,11 +276,9 @@ func (p *LimaPlugin) cleanupVM(ctx context.Context, vmName string, level Cleanup
 		}
 	}
 
-	// Execute commands inside VM
+	// Execute commands inside VM (uses SSH fallback for krunkit)
 	for _, args := range commands {
-		cmdArgs := append([]string{"shell", vmName, "--"}, args...)
-		cmd := exec.CommandContext(ctx, "limactl", cmdArgs...)
-		output, err := cmd.CombinedOutput()
+		output, err := p.execInVM(ctx, vmName, args, logger)
 		if err != nil {
 			logger.Debug("VM command failed", "vm", vmName, "cmd", strings.Join(args, " "), "error", err)
 			continue
@@ -220,18 +297,26 @@ func (p *LimaPlugin) cleanupVM(ctx context.Context, vmName string, level Cleanup
 func (p *LimaPlugin) runFSTrim(ctx context.Context, vmName string, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name() + "-fstrim"}
 
-	// Run fstrim -av to reclaim all space
-	cmd := exec.CommandContext(ctx, "limactl", "shell", vmName, "--", "sudo", "fstrim", "-av")
-	output, err := cmd.CombinedOutput()
+	// Run fstrim -av to reclaim all space (uses SSH fallback for krunkit)
+	output, err := p.execInVM(ctx, vmName, []string{"sudo", "fstrim", "-av"}, logger)
 	if err != nil {
 		logger.Debug("fstrim failed", "vm", vmName, "error", err)
+		return result
+	}
+
+	outStr := string(output)
+
+	// Detect "discard operation is not supported" — krunkit doesn't pass
+	// through TRIM/discard from guest to host. Log once and return cleanly.
+	if strings.Contains(outStr, "not supported") {
+		logger.Info("fstrim not supported by VM driver (krunkit); use offline compaction instead", "vm", vmName)
 		return result
 	}
 
 	// Parse fstrim output for bytes trimmed
 	// Example: "/var: 1.5 GiB (1610612736 bytes) trimmed on /dev/vda1"
 	re := regexp.MustCompile(`\((\d+) bytes\) trimmed`)
-	matches := re.FindAllStringSubmatch(string(output), -1)
+	matches := re.FindAllStringSubmatch(outStr, -1)
 	var totalTrimmed int64
 	for _, match := range matches {
 		if len(match) >= 2 {
@@ -250,9 +335,8 @@ func (p *LimaPlugin) runFSTrim(ctx context.Context, vmName string, logger *slog.
 }
 
 func (p *LimaPlugin) getVMDiskUsage(ctx context.Context, vmName string, logger *slog.Logger) int64 {
-	// Get disk usage via df command inside VM
-	cmd := exec.CommandContext(ctx, "limactl", "shell", vmName, "--", "df", "--output=used", "/")
-	output, err := cmd.Output()
+	// Get disk usage via df command inside VM (uses SSH fallback for krunkit)
+	output, err := p.execInVM(ctx, vmName, []string{"df", "--output=used", "/"}, logger)
 	if err != nil {
 		logger.Debug("failed to get VM disk usage", "vm", vmName, "error", err)
 		return 0
@@ -293,10 +377,8 @@ func (p *LimaPlugin) GetVMDiskInfo(ctx context.Context, vmName string) (*VMDiskI
 		return &VMDiskInfo{Name: vmName, Status: status}, nil
 	}
 
-	// Get disk usage from inside VM
-	dfCmd := exec.CommandContext(ctx, "limactl", "shell", vmName, "--",
-		"df", "--output=size,used,avail,pcent", "/")
-	dfOutput, err := dfCmd.Output()
+	// Get disk usage from inside VM (uses SSH fallback for krunkit)
+	dfOutput, err := p.execInVM(ctx, vmName, []string{"df", "--output=size,used,avail,pcent", "/"}, slog.Default())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get disk usage: %w", err)
 	}
@@ -385,9 +467,11 @@ func parseDockerReclaimedSpace(output string) int64 {
 	return 0
 }
 
-// compactDisk performs offline qcow2 compaction for a Lima VM disk image.
-// This stops the VM, converts the disk image to reclaim sparse space, verifies
-// the compacted image, and replaces the original before restarting.
+// compactDisk performs offline disk compaction for a Lima VM disk image.
+// Detects the disk format (raw or qcow2) and preserves it during compaction.
+// For raw disks (krunkit), creates a new sparse copy skipping zero blocks.
+// For qcow2 disks (qemu/vz), uses qemu-img convert to defragment.
+// This stops the VM, compacts, verifies, and replaces before restarting.
 // ONLY runs at Critical level with explicit opt-in via config.
 func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *slog.Logger) (int64, error) {
 	if vm.DiskPath == "" {
@@ -399,47 +483,63 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 		return 0, fmt.Errorf("qemu-img not available: %w", err)
 	}
 
-	// Get current host disk file size
-	hostSizeBefore := vm.HostDiskSize
-	if hostSizeBefore == 0 {
+	// Detect disk format before any operations
+	diskFormat := p.detectDiskFormat(ctx, vm.DiskPath)
+	logger.Info("detected Lima disk format", "vm", vm.Name, "format", diskFormat)
+
+	// Get current host disk file size (actual blocks, not apparent)
+	actualSizeBefore := p.getActualDiskSize(vm.DiskPath)
+	if actualSizeBefore == 0 {
 		stat, err := os.Stat(vm.DiskPath)
 		if err != nil {
 			return 0, fmt.Errorf("cannot stat disk: %w", err)
 		}
-		hostSizeBefore = stat.Size()
+		actualSizeBefore = stat.Size()
+	}
+
+	apparentSize := vm.HostDiskSize
+	if apparentSize == 0 {
+		stat, err := os.Stat(vm.DiskPath)
+		if err != nil {
+			return 0, fmt.Errorf("cannot stat disk: %w", err)
+		}
+		apparentSize = stat.Size()
 	}
 
 	// Check sparse ratio - skip if already well-compacted
-	// Compare apparent size (ls -l) vs actual blocks used
-	apparentSize := hostSizeBefore
-	actualSize := p.getActualDiskSize(vm.DiskPath)
-	if actualSize > 0 && apparentSize > 0 {
-		sparseRatio := float64(actualSize) / float64(apparentSize) * 100
+	if actualSizeBefore > 0 && apparentSize > 0 {
+		sparseRatio := float64(actualSizeBefore) / float64(apparentSize) * 100
 		if sparseRatio > 70 {
 			logger.Debug("Lima disk already well-compacted",
 				"vm", vm.Name,
+				"format", diskFormat,
 				"sparse_ratio", fmt.Sprintf("%.0f%%", sparseRatio))
 			return 0, nil
 		}
 	}
 
 	// Safety check: ensure enough free space for the temporary copy
+	// Use actual size (not apparent) — the compacted file will be ~actual size
 	diskDir := filepath.Dir(vm.DiskPath)
 	freeSpace, err := getFreeDiskSpace(diskDir)
 	if err != nil {
 		return 0, fmt.Errorf("cannot check free space: %w", err)
 	}
-	if freeSpace < uint64(hostSizeBefore) {
+	if freeSpace < uint64(actualSizeBefore) {
 		logger.Warn("skipping Lima disk compaction: insufficient free space",
 			"vm", vm.Name,
-			"disk_size_gb", fmt.Sprintf("%.1f", float64(hostSizeBefore)/(1024*1024*1024)),
+			"actual_size_gb", fmt.Sprintf("%.1f", float64(actualSizeBefore)/(1024*1024*1024)),
 			"free_gb", fmt.Sprintf("%.1f", float64(freeSpace)/(1024*1024*1024)))
 		return 0, nil
 	}
 
 	compactPath := vm.DiskPath + ".compact"
 
-	logger.Warn("CRITICAL: stopping Lima VM for disk compaction", "vm", vm.Name)
+	logger.Warn("CRITICAL: stopping Lima VM for disk compaction",
+		"vm", vm.Name,
+		"format", diskFormat,
+		"actual_gb", fmt.Sprintf("%.1f", float64(actualSizeBefore)/(1024*1024*1024)),
+		"apparent_gb", fmt.Sprintf("%.1f", float64(apparentSize)/(1024*1024*1024)))
 
 	// 1. Stop VM
 	stopCmd := exec.CommandContext(ctx, "limactl", "stop", vm.Name)
@@ -447,31 +547,42 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 		return 0, fmt.Errorf("failed to stop VM: %w (output: %s)", err, string(output))
 	}
 
-	// 2. Compact: qemu-img convert
-	logger.Info("compacting Lima disk image", "vm", vm.Name, "disk", vm.DiskPath)
-	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert", "-O", "qcow2", vm.DiskPath, compactPath)
+	// 2. Compact: qemu-img convert preserving the original format
+	logger.Info("compacting Lima disk image", "vm", vm.Name, "format", diskFormat, "disk", vm.DiskPath)
+	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert", "-O", diskFormat, vm.DiskPath, compactPath)
 	if output, err := convertCmd.CombinedOutput(); err != nil {
-		// Restart VM before returning error
 		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
 		os.Remove(compactPath)
 		return 0, fmt.Errorf("qemu-img convert failed: %w (output: %s)", err, string(output))
 	}
 
-	// 3. Verify compacted image
-	checkCmd := exec.CommandContext(ctx, "qemu-img", "check", compactPath)
-	if output, err := checkCmd.CombinedOutput(); err != nil {
-		// Verification failed - remove compact file and restart
-		os.Remove(compactPath)
-		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
-		return 0, fmt.Errorf("qemu-img check failed: %w (output: %s)", err, string(output))
+	// 3. Verify compacted image (qemu-img check only works on qcow2)
+	if diskFormat == "qcow2" {
+		checkCmd := exec.CommandContext(ctx, "qemu-img", "check", compactPath)
+		if output, err := checkCmd.CombinedOutput(); err != nil {
+			os.Remove(compactPath)
+			exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
+			return 0, fmt.Errorf("qemu-img check failed: %w (output: %s)", err, string(output))
+		}
+	} else {
+		// For raw format, verify the file size is sane (non-zero, correct apparent size)
+		compactInfo, err := os.Stat(compactPath)
+		if err != nil || compactInfo.Size() != apparentSize {
+			os.Remove(compactPath)
+			exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
+			if err != nil {
+				return 0, fmt.Errorf("cannot stat compacted raw disk: %w", err)
+			}
+			return 0, fmt.Errorf("compacted raw disk size mismatch: got %d, want %d", compactInfo.Size(), apparentSize)
+		}
 	}
 
-	// 4. Get compacted size
-	compactStat, err := os.Stat(compactPath)
-	if err != nil {
-		os.Remove(compactPath)
-		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
-		return 0, fmt.Errorf("cannot stat compacted disk: %w", err)
+	// 4. Get compacted actual size
+	compactActualSize := p.getActualDiskSize(compactPath)
+	if compactActualSize == 0 {
+		if stat, err := os.Stat(compactPath); err == nil {
+			compactActualSize = stat.Size()
+		}
 	}
 
 	// 5. Atomic replace
@@ -488,13 +599,14 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 		logger.Error("failed to restart VM after compaction", "vm", vm.Name, "error", err, "output", string(output))
 	}
 
-	freed := hostSizeBefore - compactStat.Size()
+	freed := actualSizeBefore - compactActualSize
 	if freed > 0 {
 		logger.Info("Lima disk compaction complete",
 			"vm", vm.Name,
+			"format", diskFormat,
 			"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1024*1024*1024)),
-			"before_gb", fmt.Sprintf("%.1f", float64(hostSizeBefore)/(1024*1024*1024)),
-			"after_gb", fmt.Sprintf("%.1f", float64(compactStat.Size())/(1024*1024*1024)),
+			"before_gb", fmt.Sprintf("%.1f", float64(actualSizeBefore)/(1024*1024*1024)),
+			"after_gb", fmt.Sprintf("%.1f", float64(compactActualSize)/(1024*1024*1024)),
 		)
 		return freed, nil
 	}
