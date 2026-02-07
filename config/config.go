@@ -52,6 +52,18 @@ type Config struct {
 
 	// Notification settings
 	Notify NotifyConfig `yaml:"notify"`
+
+	// Safety constraints for disk operations
+	Safety SafetyConfig `yaml:"safety"`
+
+	// Optional backup before destructive operations
+	Backup BackupConfig `yaml:"backup"`
+
+	// Goroutine pool settings
+	Pool PoolConfig `yaml:"pool"`
+
+	// OpenTelemetry observability settings
+	Observability ObservabilityConfig `yaml:"observability"`
 }
 
 // GitHubRunnerConfig holds GitHub Actions runner cleanup settings.
@@ -134,6 +146,10 @@ type LimaConfig struct {
 	VMNames []string `yaml:"vm_names"`
 	// CompactOffline enables offline qcow2 compaction at Critical level
 	CompactOffline bool `yaml:"compact_offline"`
+	// CompactMethod is the disk compaction method: "in-place" (default) or "copy".
+	// "in-place" uses zero-fill + hole-punching (safe, no extra disk space needed).
+	// "copy" uses qemu-img convert (legacy, needs 2x disk space).
+	CompactMethod string `yaml:"compact_method"`
 	// DynamicResizeEnabled enables stop/resize/restart cycle to shrink VM disks
 	// Only works with raw format disks (krunkit). Requires VM downtime.
 	DynamicResizeEnabled bool `yaml:"dynamic_resize_enabled"`
@@ -161,6 +177,10 @@ type PodmanConfig struct {
 	TrimVMDisk bool `yaml:"trim_vm_disk"`
 	// CompactDiskOffline enables offline raw disk compaction at Critical level
 	CompactDiskOffline bool `yaml:"compact_disk_offline"`
+	// CompactMethod is the disk compaction method: "in-place" (default) or "copy".
+	// "in-place" uses zero-fill + hole-punching (safe, no extra disk space needed).
+	// "copy" uses qemu-img convert (legacy, needs 2x disk space).
+	CompactMethod string `yaml:"compact_method"`
 }
 
 // ICloudConfig holds iCloud-specific cleanup settings (Darwin).
@@ -213,6 +233,62 @@ type NotifyConfig struct {
 	WebhookURL string `yaml:"webhook_url"`
 }
 
+// SafetyConfig holds safety constraints for disk operations.
+type SafetyConfig struct {
+	// OnlyShrink enforces that all disk operations only free space, never consume it.
+	// When true, any operation that would increase disk usage is blocked.
+	OnlyShrink bool `yaml:"only_shrink"`
+	// PreflightSpaceMultiplier is the required ratio of free space to estimated temp usage.
+	// E.g., 2.0 means we need 2x the estimated temp file size in free space.
+	PreflightSpaceMultiplier float64 `yaml:"preflight_space_multiplier"`
+	// MaxTempFileGB is the maximum allowed temporary file size in GB. 0 = no temp files allowed.
+	MaxTempFileGB float64 `yaml:"max_temp_file_gb"`
+}
+
+// BackupConfig holds optional backup settings for disk operations.
+type BackupConfig struct {
+	// Enabled turns on backup creation before destructive operations (default: false).
+	Enabled bool `yaml:"enabled"`
+	// MaxCount is the maximum number of backups to keep (LRU eviction).
+	MaxCount int `yaml:"max_count"`
+	// Compression algorithm: "zstd", "lz4", "gzip", or "none".
+	Compression string `yaml:"compression"`
+	// MaxTotalGB is the maximum total backup storage in GB.
+	MaxTotalGB float64 `yaml:"max_total_gb"`
+	// MinFreeGBToBackup is the minimum free GB required before creating a backup.
+	MinFreeGBToBackup float64 `yaml:"min_free_gb_to_backup"`
+}
+
+// PoolConfig holds goroutine pool settings for concurrent plugin execution.
+type PoolConfig struct {
+	// MaxWorkers is the maximum concurrent plugin goroutines (default: 4).
+	MaxWorkers int `yaml:"max_workers"`
+	// PluginTimeoutMinutes is the default timeout for each plugin in minutes (default: 30).
+	PluginTimeoutMinutes int `yaml:"plugin_timeout_minutes"`
+	// EventBufferSize is the channel buffer size for the event bus (default: 256).
+	EventBufferSize int `yaml:"event_buffer_size"`
+}
+
+// ObservabilityConfig holds OpenTelemetry settings.
+type ObservabilityConfig struct {
+	// Enabled turns on OpenTelemetry instrumentation.
+	Enabled bool `yaml:"enabled"`
+	// OTLPEndpoint is the OTLP HTTP endpoint (e.g., "http://localhost:4318").
+	OTLPEndpoint string `yaml:"otlp_endpoint"`
+	// MetricsEnabled enables metric export.
+	MetricsEnabled bool `yaml:"metrics_enabled"`
+	// TracesEnabled enables trace export.
+	TracesEnabled bool `yaml:"traces_enabled"`
+	// HeartbeatEnabled enables heartbeat file + watchdog.
+	HeartbeatEnabled bool `yaml:"heartbeat_enabled"`
+	// HeartbeatPath is the path for the heartbeat JSON file.
+	HeartbeatPath string `yaml:"heartbeat_path"`
+	// HealthPort is the localhost port for /healthz /readyz (0 = disabled).
+	HealthPort int `yaml:"health_port"`
+	// FallbackPath is the JSON file path when collector is unavailable.
+	FallbackPath string `yaml:"fallback_path"`
+}
+
 // DefaultConfig returns the default configuration.
 func DefaultConfig() *Config {
 	home, _ := os.UserHomeDir()
@@ -257,9 +333,11 @@ func DefaultConfig() *Config {
 			ProtectRunningContainers: true,
 			CleanInsideVM:            true,
 			TrimVMDisk:               true,
+			CompactMethod:            "in-place",
 		},
 		Lima: LimaConfig{
 			VMNames:                       []string{"colima", "unified"},
+			CompactMethod:                 "in-place",
 			DynamicResizeThreshold:        75,
 			DynamicResizeMinCooldownHours: 24,
 			DynamicResizeHeadroomGB:       5,
@@ -287,6 +365,31 @@ func DefaultConfig() *Config {
 		},
 		Notify: NotifyConfig{
 			Enabled: false,
+		},
+		Safety: SafetyConfig{
+			OnlyShrink:               true,
+			PreflightSpaceMultiplier: 2.0,
+			MaxTempFileGB:            0,
+		},
+		Backup: BackupConfig{
+			Enabled:           false,
+			MaxCount:          1,
+			Compression:       "zstd",
+			MaxTotalGB:        10,
+			MinFreeGBToBackup: 20,
+		},
+		Pool: PoolConfig{
+			MaxWorkers:           4,
+			PluginTimeoutMinutes: 30,
+			EventBufferSize:      256,
+		},
+		Observability: ObservabilityConfig{
+			Enabled:          false,
+			MetricsEnabled:   true,
+			TracesEnabled:    true,
+			HeartbeatEnabled: true,
+			HeartbeatPath:    filepath.Join(home, ".local", "state", "tinyland-cleanup", "heartbeat"),
+			FallbackPath:     filepath.Join(home, ".local", "log", "tinyland-cleanup-otel.json"),
 		},
 	}
 

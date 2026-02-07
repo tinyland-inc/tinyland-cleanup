@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
+	"gitlab.com/tinyland/lab/tinyland-cleanup/pkg/fsops"
 )
 
 // LimaPlugin handles Lima VM cleanup and disk resize operations.
@@ -120,7 +121,7 @@ func (p *LimaPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *confi
 		if level >= LevelCritical && cfg.Lima.CompactOffline {
 			diskInfo, err := p.GetVMDiskInfo(ctx, vmName)
 			if err == nil && diskInfo.DiskPath != "" {
-				compactFreed, err := p.compactDisk(ctx, diskInfo, logger)
+				compactFreed, err := p.compactDiskInPlace(ctx, diskInfo, cfg, logger)
 				if err != nil {
 					logger.Warn("Lima disk compaction failed", "vm", vmName, "error", err)
 				} else if compactFreed > 0 {
@@ -483,13 +484,139 @@ func parseDockerReclaimedSpace(output string) int64 {
 	return 0
 }
 
-// compactDisk performs offline disk compaction for a Lima VM disk image.
-// Detects the disk format (raw or qcow2) and preserves it during compaction.
-// For raw disks (krunkit), creates a new sparse copy skipping zero blocks.
-// For qcow2 disks (qemu/vz), uses qemu-img convert to defragment.
-// This stops the VM, compacts, verifies, and replaces before restarting.
+// compactDiskInPlace performs in-place disk compaction for a Lima VM disk image.
+// Instead of creating a copy (which requires 2x disk space), it:
+// 1. Zero-fills free blocks inside the running VM
+// 2. Stops the VM
+// 3. Punches holes in zero regions (fsops.CompactInPlace) to free host space
+// 4. Always restarts the VM, even on error
+// Falls back to legacy copy-based compaction if compact_method == "copy".
 // ONLY runs at Critical level with explicit opt-in via config.
-func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *slog.Logger) (int64, error) {
+func (p *LimaPlugin) compactDiskInPlace(ctx context.Context, vm *VMDiskInfo, cfg *config.Config, logger *slog.Logger) (int64, error) {
+	if vm.DiskPath == "" {
+		return 0, fmt.Errorf("no disk path for VM %s", vm.Name)
+	}
+
+	// If compact_method is "copy", delegate to legacy implementation
+	if cfg.Lima.CompactMethod == "copy" {
+		logger.Info("using legacy copy-based compaction", "vm", vm.Name)
+		return p.compactDiskLegacy(ctx, vm, logger)
+	}
+
+	// Pre-flight: in-place operations need 0 temp space
+	diskDir := filepath.Dir(vm.DiskPath)
+	preflight := PreflightOnlyShrink(diskDir, 0, &cfg.Safety)
+	if !preflight.Safe {
+		return 0, fmt.Errorf("pre-flight check failed: %s", preflight.Reason)
+	}
+
+	// Get actual size before compaction
+	actualSizeBefore, err := fsops.GetActualSize(vm.DiskPath)
+	if err != nil {
+		return 0, fmt.Errorf("cannot get actual disk size: %w", err)
+	}
+
+	apparentSize := vm.HostDiskSize
+	if apparentSize == 0 {
+		stat, err := os.Stat(vm.DiskPath)
+		if err != nil {
+			return 0, fmt.Errorf("cannot stat disk: %w", err)
+		}
+		apparentSize = stat.Size()
+	}
+
+	// Check sparse ratio - skip if already well-compacted (>70%)
+	if actualSizeBefore > 0 && apparentSize > 0 {
+		sparseRatio := float64(actualSizeBefore) / float64(apparentSize) * 100
+		if sparseRatio > 70 {
+			logger.Debug("Lima disk already well-compacted",
+				"vm", vm.Name,
+				"sparse_ratio", fmt.Sprintf("%.0f%%", sparseRatio))
+			return 0, nil
+		}
+	}
+
+	logger.Info("compacting Lima disk in-place",
+		"vm", vm.Name,
+		"actual_gb", fmt.Sprintf("%.1f", float64(actualSizeBefore)/(1024*1024*1024)),
+		"apparent_gb", fmt.Sprintf("%.1f", float64(apparentSize)/(1024*1024*1024)))
+
+	// Step 1: Zero-fill free blocks inside the running VM
+	logger.Info("zero-filling free blocks inside VM", "vm", vm.Name)
+	_, err = p.execInVM(ctx, vm.Name, []string{"sh", "-c", "dd if=/dev/zero of=/tmp/_zero_fill bs=1M 2>/dev/null; sync; rm -f /tmp/_zero_fill"}, logger)
+	if err != nil {
+		logger.Warn("zero-fill inside VM failed (continuing with hole punch)", "vm", vm.Name, "error", err)
+	}
+
+	// Step 2: Stop VM
+	logger.Warn("stopping Lima VM for in-place compaction", "vm", vm.Name)
+	stopCmd := exec.CommandContext(ctx, "limactl", "stop", vm.Name)
+	if output, err := stopCmd.CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("failed to stop VM: %w (output: %s)", err, string(output))
+	}
+
+	// Ensure VM is ALWAYS restarted, even on error
+	var restartErr error
+	defer func() {
+		logger.Info("restarting Lima VM after in-place compaction", "vm", vm.Name)
+		startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
+		if output, err := startCmd.CombinedOutput(); err != nil {
+			restartErr = fmt.Errorf("failed to restart VM after compaction: %w (output: %s)", err, string(output))
+			logger.Error("failed to restart VM after compaction", "vm", vm.Name, "error", err, "output", string(output))
+		}
+	}()
+
+	// Step 3: In-place hole punch
+	logger.Info("punching holes in zero regions", "vm", vm.Name, "disk", vm.DiskPath)
+	holesFreed, err := fsops.CompactInPlace(vm.DiskPath, fsops.DefaultBlockSize)
+	if err != nil {
+		return 0, fmt.Errorf("in-place hole punch failed: %w", err)
+	}
+
+	// Step 4: Get actual size after compaction
+	actualSizeAfter, err := fsops.GetActualSize(vm.DiskPath)
+	if err != nil {
+		logger.Warn("cannot verify actual size after compaction", "error", err)
+		// Still return holesFreed as our best estimate
+		if restartErr != nil {
+			return holesFreed, restartErr
+		}
+		return holesFreed, nil
+	}
+
+	// Step 5: Assert only-shrink invariant
+	if err := AssertOnlyShrink(actualSizeBefore, actualSizeAfter, "lima-compact-in-place"); err != nil {
+		logger.Error("ONLY-SHRINK violation detected", "error", err)
+		return 0, err
+	}
+
+	freed := actualSizeBefore - actualSizeAfter
+	if freed > 0 {
+		logger.Info("Lima in-place compaction complete",
+			"vm", vm.Name,
+			"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1024*1024*1024)),
+			"holes_freed_gb", fmt.Sprintf("%.1f", float64(holesFreed)/(1024*1024*1024)),
+			"before_gb", fmt.Sprintf("%.1f", float64(actualSizeBefore)/(1024*1024*1024)),
+			"after_gb", fmt.Sprintf("%.1f", float64(actualSizeAfter)/(1024*1024*1024)),
+		)
+		if restartErr != nil {
+			return freed, restartErr
+		}
+		return freed, nil
+	}
+
+	if restartErr != nil {
+		return 0, restartErr
+	}
+	return 0, nil
+}
+
+// compactDiskLegacy performs copy-based offline disk compaction for a Lima VM disk image.
+// This is the legacy implementation that requires 2x disk space for the temporary copy.
+// Detects the disk format (raw or qcow2) and preserves it during compaction.
+// This stops the VM, compacts via qemu-img convert, verifies, and replaces before restarting.
+// Only used when compact_method == "copy".
+func (p *LimaPlugin) compactDiskLegacy(ctx context.Context, vm *VMDiskInfo, logger *slog.Logger) (int64, error) {
 	if vm.DiskPath == "" {
 		return 0, fmt.Errorf("no disk path for VM %s", vm.Name)
 	}
@@ -535,7 +662,7 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 	}
 
 	// Safety check: ensure enough free space for the temporary copy
-	// Use actual size (not apparent) — the compacted file will be ~actual size
+	// Use actual size (not apparent) -- the compacted file will be ~actual size
 	diskDir := filepath.Dir(vm.DiskPath)
 	freeSpace, err := getFreeDiskSpace(diskDir)
 	if err != nil {
@@ -551,7 +678,7 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 
 	compactPath := vm.DiskPath + ".compact"
 
-	logger.Warn("CRITICAL: stopping Lima VM for disk compaction",
+	logger.Warn("CRITICAL: stopping Lima VM for legacy disk compaction",
 		"vm", vm.Name,
 		"format", diskFormat,
 		"actual_gb", fmt.Sprintf("%.1f", float64(actualSizeBefore)/(1024*1024*1024)),
@@ -564,7 +691,7 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 	}
 
 	// 2. Compact: qemu-img convert preserving the original format
-	logger.Info("compacting Lima disk image", "vm", vm.Name, "format", diskFormat, "disk", vm.DiskPath)
+	logger.Info("compacting Lima disk image (legacy copy)", "vm", vm.Name, "format", diskFormat, "disk", vm.DiskPath)
 	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert", "-O", diskFormat, vm.DiskPath, compactPath)
 	if output, err := convertCmd.CombinedOutput(); err != nil {
 		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
@@ -609,7 +736,7 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 	}
 
 	// 6. Restart VM
-	logger.Info("restarting Lima VM after compaction", "vm", vm.Name)
+	logger.Info("restarting Lima VM after legacy compaction", "vm", vm.Name)
 	startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
 	if output, err := startCmd.CombinedOutput(); err != nil {
 		logger.Error("failed to restart VM after compaction", "vm", vm.Name, "error", err, "output", string(output))
@@ -617,7 +744,7 @@ func (p *LimaPlugin) compactDisk(ctx context.Context, vm *VMDiskInfo, logger *sl
 
 	freed := actualSizeBefore - compactActualSize
 	if freed > 0 {
-		logger.Info("Lima disk compaction complete",
+		logger.Info("Lima legacy disk compaction complete",
 			"vm", vm.Name,
 			"format", diskFormat,
 			"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1024*1024*1024)),
@@ -761,7 +888,7 @@ func (p *LimaPlugin) dynamicResize(ctx context.Context, vm *VMDiskInfo, cfg *con
 		"target_gb", targetGB)
 
 	// Perform the resize
-	freed, err := p.resizeAndRestart(ctx, vm, targetGB, logger)
+	freed, err := p.shrinkDiskInPlace(ctx, vm, targetGB, cfg, logger)
 	if err != nil {
 		return 0, err
 	}
@@ -813,73 +940,97 @@ func (p *LimaPlugin) isKubernetesRunning(ctx context.Context, vmName string, log
 	return false
 }
 
-// resizeAndRestart stops the VM, resizes the raw disk, and restarts.
-// Always attempts restart even if resize fails. Returns host bytes freed.
-func (p *LimaPlugin) resizeAndRestart(ctx context.Context, vm *VMDiskInfo, targetGB int64, logger *slog.Logger) (int64, error) {
-	hostSizeBefore := p.getActualDiskSize(vm.DiskPath)
+// shrinkDiskInPlace shrinks a raw VM disk using in-place hole punching and truncation.
+// Instead of creating a copy, it:
+// 1. Zero-fills free blocks inside the running VM
+// 2. Stops the VM
+// 3. Punches holes in zero regions to free host space
+// 4. Truncates with qemu-img resize --shrink (ftruncate on raw, no copy)
+// 5. Always restarts the VM, even on error
+// 6. Resizes guest filesystem if needed
+// Only works on raw format disks (krunkit).
+func (p *LimaPlugin) shrinkDiskInPlace(ctx context.Context, vm *VMDiskInfo, targetGB int64, cfg *config.Config, logger *slog.Logger) (int64, error) {
+	// Pre-flight: only raw format supported
+	diskFormat := p.detectDiskFormat(ctx, vm.DiskPath)
+	if diskFormat != "raw" {
+		return 0, fmt.Errorf("shrinkDiskInPlace only supports raw format, got %s", diskFormat)
+	}
 
-	// 1. Stop VM
+	// Get host actual size before
+	hostSizeBefore, err := fsops.GetActualSize(vm.DiskPath)
+	if err != nil {
+		return 0, fmt.Errorf("cannot get actual disk size: %w", err)
+	}
+
+	// Step 1: Zero-fill free blocks inside the running VM
+	logger.Info("zero-filling free blocks inside VM before shrink", "vm", vm.Name)
+	_, err = p.execInVM(ctx, vm.Name, []string{"sh", "-c", "dd if=/dev/zero of=/tmp/_zero_fill bs=1M 2>/dev/null; sync; rm -f /tmp/_zero_fill"}, logger)
+	if err != nil {
+		logger.Warn("zero-fill inside VM failed (continuing)", "vm", vm.Name, "error", err)
+	}
+
+	// Step 2: Stop VM
+	logger.Warn("stopping Lima VM for in-place shrink", "vm", vm.Name, "target_gb", targetGB)
 	stopCmd := exec.CommandContext(ctx, "limactl", "stop", vm.Name)
 	if output, err := stopCmd.CombinedOutput(); err != nil {
-		return 0, fmt.Errorf("failed to stop VM for resize: %w (output: %s)", err, string(output))
+		return 0, fmt.Errorf("failed to stop VM for shrink: %w (output: %s)", err, string(output))
 	}
 
-	// 2. Resize disk via qemu-img convert to a smaller sparse raw image
-	// We can't use `qemu-img resize --shrink` on raw because it just truncates.
-	// Instead, create a new sparse raw image at the target size, then dd the
-	// data from old to new. But that's risky if the guest fs extends beyond target.
-	//
-	// Safer approach: create a new raw sparse image at targetGB, then use
-	// qemu-img convert to copy only the used blocks.
-	compactPath := vm.DiskPath + ".resized"
-	defer os.Remove(compactPath) // cleanup on any path
+	// Ensure VM is ALWAYS restarted, even on error
+	vmRestarted := false
+	defer func() {
+		if vmRestarted {
+			return
+		}
+		logger.Info("restarting Lima VM after shrink (defer)", "vm", vm.Name)
+		startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
+		if output, err := startCmd.CombinedOutput(); err != nil {
+			logger.Error("failed to restart VM after shrink", "vm", vm.Name, "error", err, "output", string(output))
+		}
+	}()
 
-	// Create a new raw image at the target size
-	createCmd := exec.CommandContext(ctx, "qemu-img", "create", "-f", "raw", compactPath, fmt.Sprintf("%dG", targetGB))
-	if output, err := createCmd.CombinedOutput(); err != nil {
-		// Restart VM before returning error
-		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
-		return 0, fmt.Errorf("failed to create resized disk: %w (output: %s)", err, string(output))
-	}
-
-	// Convert (copy used blocks from old to new, preserving sparseness)
-	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert", "-O", "raw", vm.DiskPath, compactPath)
-	if output, err := convertCmd.CombinedOutput(); err != nil {
-		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
-		return 0, fmt.Errorf("qemu-img convert failed during resize: %w (output: %s)", err, string(output))
-	}
-
-	// Verify the new image has correct apparent size
-	newInfo, err := os.Stat(compactPath)
+	// Step 3: Hole punch to free zero regions
+	logger.Info("punching holes in zero regions", "vm", vm.Name, "disk", vm.DiskPath)
+	holesFreed, err := fsops.CompactInPlace(vm.DiskPath, fsops.DefaultBlockSize)
 	if err != nil {
-		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
-		return 0, fmt.Errorf("cannot stat resized disk: %w", err)
+		return 0, fmt.Errorf("in-place hole punch failed: %w", err)
 	}
-	expectedApparent := targetGB * 1024 * 1024 * 1024
-	if newInfo.Size() != expectedApparent {
-		// qemu-img convert preserves source apparent size, not target.
-		// This is expected -- the convert copies data, doesn't resize.
-		// The actual host blocks used should still be smaller.
-		logger.Debug("resized disk apparent size differs from target",
-			"apparent", newInfo.Size(), "target", expectedApparent,
-			"note", "qemu-img convert preserves source geometry")
+	logger.Info("hole punch complete", "vm", vm.Name, "holes_freed_gb", fmt.Sprintf("%.1f", float64(holesFreed)/(1024*1024*1024)))
+
+	// Step 4: Truncate with qemu-img resize --shrink (ftruncate on raw, no copy)
+	resizeArg := fmt.Sprintf("%dG", targetGB)
+	logger.Info("truncating raw disk", "vm", vm.Name, "target", resizeArg)
+	resizeCmd := exec.CommandContext(ctx, "qemu-img", "resize", "--shrink", vm.DiskPath, resizeArg)
+	if output, err := resizeCmd.CombinedOutput(); err != nil {
+		logger.Warn("qemu-img resize --shrink failed", "vm", vm.Name, "error", err, "output", string(output))
+		// Non-fatal: hole punching already freed space. Continue to restart.
 	}
 
-	// 3. Atomic replace
-	if err := os.Rename(compactPath, vm.DiskPath); err != nil {
-		exec.CommandContext(ctx, "limactl", "start", vm.Name).Run()
-		return 0, fmt.Errorf("failed to replace disk image: %w", err)
+	// Step 5: Get host size after
+	hostSizeAfter, err := fsops.GetActualSize(vm.DiskPath)
+	if err != nil {
+		logger.Warn("cannot verify actual size after shrink", "error", err)
+		hostSizeAfter = hostSizeBefore // conservative: assume no change for assertion
 	}
 
-	// 4. Restart VM (always, even if something above failed partially)
-	logger.Info("restarting Lima VM after dynamic resize", "vm", vm.Name)
+	// Step 6: Restart VM
+	logger.Info("restarting Lima VM after shrink", "vm", vm.Name)
+	vmRestarted = true
 	startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
-	if output, err := startCmd.CombinedOutput(); err != nil {
-		logger.Error("failed to restart VM after resize", "vm", vm.Name, "error", err, "output", string(output))
+	if output, startErr := startCmd.CombinedOutput(); startErr != nil {
+		logger.Error("failed to restart VM after shrink", "vm", vm.Name, "error", startErr, "output", string(output))
 	}
 
-	// Calculate freed space on host
-	hostSizeAfter := p.getActualDiskSize(vm.DiskPath)
+	// Step 7: Resize guest filesystem if needed (ignore errors - fs may auto-resize)
+	logger.Debug("attempting guest filesystem resize", "vm", vm.Name)
+	_, _ = p.execInVM(ctx, vm.Name, []string{"sudo", "resize2fs", "/dev/vda"}, logger)
+
+	// Step 8: Assert only-shrink invariant
+	if err := AssertOnlyShrink(hostSizeBefore, hostSizeAfter, "lima-shrink-in-place"); err != nil {
+		logger.Error("ONLY-SHRINK violation detected", "error", err)
+		return 0, err
+	}
+
 	if hostSizeBefore > hostSizeAfter {
 		return hostSizeBefore - hostSizeAfter, nil
 	}

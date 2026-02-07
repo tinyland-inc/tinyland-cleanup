@@ -33,7 +33,9 @@ go_binary(
     },
     deps = [
         ":config",
+        ":daemon",
         ":monitor",
+        ":otel",
         ":plugins",
     ],
 )
@@ -55,14 +57,22 @@ go_library(
 go_library(
     name = "plugins",
     srcs = [
+        "plugins/backup.go",
         "plugins/cache.go",
+        "plugins/devartifacts.go",
         "plugins/docker.go",
         "plugins/etcd.go",
+        "plugins/fs.go",
+        "plugins/github_runner.go",
         "plugins/gitlab_runner.go",
         "plugins/nix.go",
         "plugins/plugin.go",
         "plugins/podman.go",
+        "plugins/preflight.go",
+        "plugins/registry.go",
         "plugins/rke2.go",
+        "plugins/sudo.go",
+        "plugins/yum.go",
     ] + select({
         "@platforms//os:macos": [
             "plugins/darwin.go",
@@ -74,6 +84,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         ":config",
+        ":fsops",
     ],
 )
 
@@ -84,6 +95,58 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "@com_github_shirou_gopsutil_v3//disk",
+    ],
+)
+
+go_library(
+    name = "fsops",
+    srcs = [
+        "pkg/fsops/fsops.go",
+        "pkg/fsops/zero.go",
+    ] + select({
+        "@platforms//os:macos": ["pkg/fsops/fsops_darwin.go"],
+        "@platforms//os:linux": ["pkg/fsops/fsops_linux.go"],
+        "//conditions:default": ["pkg/fsops/fsops_unsupported.go"],
+    }),
+    importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/pkg/fsops",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_golang_x_sys//unix",
+    ],
+)
+
+go_library(
+    name = "daemon",
+    srcs = [
+        "daemon/daemon.go",
+        "daemon/events.go",
+        "daemon/pool.go",
+        "daemon/subscribers.go",
+    ],
+    importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/daemon",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":config",
+        ":plugins",
+    ],
+)
+
+go_library(
+    name = "otel",
+    srcs = [
+        "otel/otel.go",
+        "otel/otel_config.go",
+        "otel/otel_fallback.go",
+        "otel/otel_health.go",
+        "otel/otel_heartbeat.go",
+        "otel/otel_metrics.go",
+        "otel/otel_slog.go",
+        "otel/otel_traces.go",
+    ],
+    importpath = "gitlab.com/tinyland/lab/tinyland-cleanup/otel",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":config",
     ],
 )
 
@@ -131,6 +194,37 @@ go_test(
     timeout = "short",
 )
 
+go_test(
+    name = "fsops_test",
+    srcs = ["pkg/fsops/fsops_test.go"],
+    embed = [":fsops"],
+    timeout = "short",
+)
+
+go_test(
+    name = "daemon_test",
+    srcs = [
+        "daemon/events_test.go",
+        "daemon/pool_test.go",
+    ],
+    embed = [":daemon"],
+    deps = [
+        ":config",
+        ":plugins",
+    ],
+    timeout = "short",
+)
+
+go_test(
+    name = "otel_test",
+    srcs = ["otel/otel_test.go"],
+    embed = [":otel"],
+    deps = [
+        ":config",
+    ],
+    timeout = "short",
+)
+
 # =============================================================================
 # Test Suites
 # =============================================================================
@@ -140,7 +234,10 @@ test_suite(
     name = "all_tests",
     tests = [
         ":config_test",
+        ":daemon_test",
+        ":fsops_test",
         ":monitor_test",
+        ":otel_test",
         ":plugins_test",
     ],
 )
@@ -150,7 +247,10 @@ test_suite(
     name = "linux_tests",
     tests = [
         ":config_test",
+        ":daemon_test",
+        ":fsops_test",
         ":monitor_test",
+        ":otel_test",
         ":plugins_test",
     ],
 )
@@ -160,7 +260,10 @@ test_suite(
     name = "darwin_tests",
     tests = [
         ":config_test",
+        ":daemon_test",
+        ":fsops_test",
         ":monitor_test",
+        ":otel_test",
         ":plugins_test",
     ],
 )
@@ -170,7 +273,10 @@ test_suite(
     name = "pbt_tests",
     tests = [
         ":config_test",
+        ":daemon_test",
+        ":fsops_test",
         ":monitor_test",
+        ":otel_test",
         ":plugins_test",
     ],
 )
