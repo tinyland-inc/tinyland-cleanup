@@ -137,7 +137,8 @@ type LimaConfig struct {
 	// DynamicResizeEnabled enables stop/resize/restart cycle to shrink VM disks
 	// Only works with raw format disks (krunkit). Requires VM downtime.
 	DynamicResizeEnabled bool `yaml:"dynamic_resize_enabled"`
-	// DynamicResizeThreshold is the guest disk usage % that triggers resize (default: 75)
+	// DynamicResizeThreshold is the max guest disk usage % at which resize is worthwhile (default: 75).
+	// Resize triggers when guest usage is AT OR BELOW this value (lots of wasted space to reclaim).
 	DynamicResizeThreshold int `yaml:"dynamic_resize_threshold"`
 	// DynamicResizeMinCooldownHours is the minimum hours between resize operations (default: 24)
 	DynamicResizeMinCooldownHours int `yaml:"dynamic_resize_min_cooldown_hours"`

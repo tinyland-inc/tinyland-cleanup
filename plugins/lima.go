@@ -85,7 +85,7 @@ func (p *LimaPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *confi
 			continue
 		}
 
-		logger.Debug("processing Lima VM", "vm", vmName, "level", level.String())
+		logger.Info("processing Lima VM", "vm", vmName, "level", level.String())
 
 		// Check disk usage before cleanup
 		diskUsageBefore := p.getVMDiskUsage(ctx, vmName, logger)
@@ -678,11 +678,15 @@ func (p *LimaPlugin) dynamicResize(ctx context.Context, vm *VMDiskInfo, cfg *con
 	// space via compaction already.
 	diskFormat := p.detectDiskFormat(ctx, vm.DiskPath)
 	if diskFormat != "raw" {
-		logger.Debug("dynamic resize skipped: not a raw format disk", "vm", vm.Name, "format", diskFormat)
+		logger.Info("dynamic resize skipped: not a raw format disk", "vm", vm.Name, "format", diskFormat)
 		return 0, nil
 	}
 
-	// Check guest disk usage against threshold
+	// Check guest disk usage against threshold.
+	// Dynamic resize SHRINKS the VM disk to reclaim host space.
+	// It triggers when guest usage is LOW (lots of wasted space to reclaim).
+	// Threshold = max guest usage % at which resize is worthwhile.
+	// E.g., threshold=50 → resize when guest uses ≤50% (≥50% is wasted).
 	usedPercent, err := strconv.Atoi(strings.TrimSuffix(vm.UsedPercent, "%"))
 	if err != nil || usedPercent == 0 {
 		return 0, nil
@@ -692,8 +696,8 @@ func (p *LimaPlugin) dynamicResize(ctx context.Context, vm *VMDiskInfo, cfg *con
 	if threshold <= 0 {
 		threshold = 75
 	}
-	if usedPercent < threshold {
-		logger.Debug("dynamic resize skipped: usage below threshold",
+	if usedPercent > threshold {
+		logger.Info("dynamic resize skipped: guest too full to shrink effectively",
 			"vm", vm.Name, "used_percent", usedPercent, "threshold", threshold)
 		return 0, nil
 	}
@@ -707,7 +711,7 @@ func (p *LimaPlugin) dynamicResize(ctx context.Context, vm *VMDiskInfo, cfg *con
 		}
 		elapsed := time.Since(record.LastResize)
 		if elapsed < time.Duration(cooldownHours)*time.Hour {
-			logger.Debug("dynamic resize skipped: cool-down active",
+			logger.Info("dynamic resize skipped: cool-down active",
 				"vm", vm.Name, "hours_since_last", int(elapsed.Hours()), "cooldown_hours", cooldownHours)
 			return 0, nil
 		}
@@ -730,7 +734,7 @@ func (p *LimaPlugin) dynamicResize(ctx context.Context, vm *VMDiskInfo, cfg *con
 
 	// Don't resize if target is >= current apparent size (nothing to gain)
 	if targetBytes >= vm.TotalBytes {
-		logger.Debug("dynamic resize skipped: target >= current size",
+		logger.Info("dynamic resize skipped: target >= current size",
 			"vm", vm.Name,
 			"target_gb", targetBytes/(1024*1024*1024),
 			"current_gb", vm.TotalBytes/(1024*1024*1024))
