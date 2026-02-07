@@ -55,6 +55,10 @@ func (p *LimaPlugin) Enabled(cfg *config.Config) bool {
 }
 
 // Cleanup performs Lima VM cleanup at the specified level.
+// The method separates two concerns:
+//  1. In-VM cleanup (docker prune, fstrim) - only for running VMs
+//  2. Offline disk ops (compact, dynamic resize) - work on the disk file,
+//     can operate on stopped VMs since they stop/start the VM themselves.
 func (p *LimaPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{
 		Plugin: p.Name(),
@@ -67,26 +71,20 @@ func (p *LimaPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *confi
 		return result
 	}
 
-	// Get running VMs
+	// Get running VMs for in-VM cleanup
 	runningVMs, err := p.getRunningVMs(ctx)
 	if err != nil {
-		result.Error = err
-		return result
+		logger.Warn("failed to list running VMs", "error", err)
+		// Continue - we can still do offline disk ops
 	}
 
-	if len(runningVMs) == 0 {
-		logger.Debug("no running Lima VMs found")
-		return result
-	}
-
-	// Process configured VMs
+	// Phase 1: In-VM cleanup (only for running VMs)
 	for _, vmName := range cfg.Lima.VMNames {
 		if !contains(runningVMs, vmName) {
-			logger.Debug("VM not running", "vm", vmName)
 			continue
 		}
 
-		logger.Info("processing Lima VM", "vm", vmName, "level", level.String())
+		logger.Info("processing Lima VM (in-VM cleanup)", "vm", vmName, "level", level.String())
 
 		// Check disk usage before cleanup
 		diskUsageBefore := p.getVMDiskUsage(ctx, vmName, logger)
@@ -116,11 +114,17 @@ func (p *LimaPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *confi
 				)
 			}
 		}
+	}
+
+	// Phase 2: Offline disk operations (work on any VM with a disk file)
+	for _, vmName := range cfg.Lima.VMNames {
+		isRunning := contains(runningVMs, vmName)
 
 		// At Critical level with compact_offline enabled, do offline compaction
 		if level >= LevelCritical && cfg.Lima.CompactOffline {
-			diskInfo, err := p.GetVMDiskInfo(ctx, vmName)
-			if err == nil && diskInfo.DiskPath != "" {
+			diskInfo := p.getVMDiskInfoOffline(vmName, isRunning, logger)
+			if diskInfo != nil && diskInfo.DiskPath != "" {
+				logger.Info("attempting offline disk compaction", "vm", vmName, "running", isRunning)
 				compactFreed, err := p.compactDiskInPlace(ctx, diskInfo, cfg, logger)
 				if err != nil {
 					logger.Warn("Lima disk compaction failed", "vm", vmName, "error", err)
@@ -132,7 +136,8 @@ func (p *LimaPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *confi
 		}
 
 		// At Moderate+ level with dynamic_resize enabled, try shrinking VM disk
-		if level >= LevelModerate && cfg.Lima.DynamicResizeEnabled {
+		// Dynamic resize requires a running VM to get guest usage info
+		if level >= LevelModerate && cfg.Lima.DynamicResizeEnabled && isRunning {
 			diskInfo, err := p.GetVMDiskInfo(ctx, vmName)
 			if err == nil && diskInfo.DiskPath != "" {
 				resizeFreed, err := p.dynamicResize(ctx, diskInfo, cfg, logger)
@@ -437,6 +442,36 @@ func (p *LimaPlugin) GetVMDiskInfo(ctx context.Context, vmName string) (*VMDiskI
 	}, nil
 }
 
+// getVMDiskInfoOffline returns disk info for a VM using only host-side data.
+// This works for stopped, broken, or non-running VMs where we can't SSH in
+// to get guest usage stats. It discovers the disk path and host file size.
+func (p *LimaPlugin) getVMDiskInfoOffline(vmName string, isRunning bool, logger *slog.Logger) *VMDiskInfo {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		logger.Debug("cannot determine home dir for VM disk lookup", "error", err)
+		return nil
+	}
+
+	diskPath := filepath.Join(home, ".lima", vmName, "diffdisk")
+	stat, err := os.Stat(diskPath)
+	if err != nil {
+		logger.Debug("VM disk file not found", "vm", vmName, "path", diskPath, "error", err)
+		return nil
+	}
+
+	status := "Stopped"
+	if isRunning {
+		status = "Running"
+	}
+
+	return &VMDiskInfo{
+		Name:         vmName,
+		Status:       status,
+		HostDiskSize: stat.Size(),
+		DiskPath:     diskPath,
+	}
+}
+
 // VMDiskInfo contains disk information for a Lima VM.
 type VMDiskInfo struct {
 	Name           string
@@ -536,28 +571,38 @@ func (p *LimaPlugin) compactDiskInPlace(ctx context.Context, vm *VMDiskInfo, cfg
 		}
 	}
 
+	vmWasRunning := vm.Status == "Running"
+
 	logger.Info("compacting Lima disk in-place",
 		"vm", vm.Name,
+		"running", vmWasRunning,
 		"actual_gb", fmt.Sprintf("%.1f", float64(actualSizeBefore)/(1024*1024*1024)),
 		"apparent_gb", fmt.Sprintf("%.1f", float64(apparentSize)/(1024*1024*1024)))
 
-	// Step 1: Zero-fill free blocks inside the running VM
-	logger.Info("zero-filling free blocks inside VM", "vm", vm.Name)
-	_, err = p.execInVM(ctx, vm.Name, []string{"sh", "-c", "dd if=/dev/zero of=/tmp/_zero_fill bs=1M 2>/dev/null; sync; rm -f /tmp/_zero_fill"}, logger)
-	if err != nil {
-		logger.Warn("zero-fill inside VM failed (continuing with hole punch)", "vm", vm.Name, "error", err)
+	if vmWasRunning {
+		// Step 1: Zero-fill free blocks inside the running VM
+		logger.Info("zero-filling free blocks inside VM", "vm", vm.Name)
+		_, err = p.execInVM(ctx, vm.Name, []string{"sh", "-c", "dd if=/dev/zero of=/tmp/_zero_fill bs=1M 2>/dev/null; sync; rm -f /tmp/_zero_fill"}, logger)
+		if err != nil {
+			logger.Warn("zero-fill inside VM failed (continuing with hole punch)", "vm", vm.Name, "error", err)
+		}
+
+		// Step 2: Stop VM
+		logger.Warn("stopping Lima VM for in-place compaction", "vm", vm.Name)
+		stopCmd := exec.CommandContext(ctx, "limactl", "stop", vm.Name)
+		if output, err := safeCombinedOutput(stopCmd); err != nil {
+			return 0, fmt.Errorf("failed to stop VM: %w (output: %s)", err, string(output))
+		}
+	} else {
+		logger.Info("VM already stopped, skipping zero-fill and stop", "vm", vm.Name)
 	}
 
-	// Step 2: Stop VM
-	logger.Warn("stopping Lima VM for in-place compaction", "vm", vm.Name)
-	stopCmd := exec.CommandContext(ctx, "limactl", "stop", vm.Name)
-	if output, err := safeCombinedOutput(stopCmd); err != nil {
-		return 0, fmt.Errorf("failed to stop VM: %w (output: %s)", err, string(output))
-	}
-
-	// Ensure VM is ALWAYS restarted, even on error
+	// Ensure VM is restarted if it was running before we started
 	var restartErr error
 	defer func() {
+		if !vmWasRunning {
+			return // Don't start a VM that wasn't running
+		}
 		logger.Info("restarting Lima VM after in-place compaction", "vm", vm.Name)
 		startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
 		if output, err := safeCombinedOutput(startCmd); err != nil {
