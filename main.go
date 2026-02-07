@@ -29,9 +29,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
+	cleanup "gitlab.com/tinyland/lab/tinyland-cleanup/daemon"
 	"gitlab.com/tinyland/lab/tinyland-cleanup/monitor"
 	"gitlab.com/tinyland/lab/tinyland-cleanup/plugins"
 )
@@ -111,14 +111,11 @@ func main() {
 		cfg.Thresholds.Critical,
 	)
 
-	// Create cleanup daemon
-	d := &daemon{
-		config:   cfg,
-		registry: registry,
-		monitor:  diskMon,
-		logger:   logger,
-		dryRun:   *dryRun,
-	}
+	// Create cleanup daemon with event bus + goroutine pool
+	d := cleanup.New(cfg, registry, diskMon, logger)
+	d.DryRun = *dryRun
+	d.SetupSubscribers()
+	defer d.Close()
 
 	// Determine operation mode
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,7 +133,7 @@ func main() {
 	// If level is specified, force that level
 	if *level != "" {
 		forcedLevel := parseLevel(*level)
-		if err := d.runOnce(ctx, forcedLevel); err != nil {
+		if err := d.RunOnce(ctx, forcedLevel); err != nil {
 			logger.Error("cleanup failed", "error", err)
 			os.Exit(1)
 		}
@@ -145,7 +142,7 @@ func main() {
 
 	// Run once or as daemon
 	if *once || !*runDaemon {
-		if err := d.runOnce(ctx, monitor.LevelNone); err != nil {
+		if err := d.RunOnce(ctx, monitor.LevelNone); err != nil {
 			logger.Error("cleanup failed", "error", err)
 			os.Exit(1)
 		}
@@ -161,166 +158,10 @@ func main() {
 		"critical", cfg.Thresholds.Critical,
 	)
 
-	if err := d.run(ctx); err != nil && err != context.Canceled {
+	if err := d.Run(ctx); err != nil && err != context.Canceled {
 		logger.Error("daemon error", "error", err)
 		os.Exit(1)
 	}
-}
-
-type daemon struct {
-	config   *config.Config
-	registry *plugins.Registry
-	monitor  *monitor.DiskMonitor
-	logger   *slog.Logger
-	dryRun   bool
-}
-
-func (d *daemon) run(ctx context.Context) error {
-	ticker := time.NewTicker(time.Duration(d.config.PollInterval) * time.Second)
-	defer ticker.Stop()
-
-	// Run immediately on start
-	if err := d.runOnce(ctx, monitor.LevelNone); err != nil {
-		d.logger.Error("initial cleanup failed", "error", err)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := d.runOnce(ctx, monitor.LevelNone); err != nil {
-				d.logger.Error("cleanup cycle failed", "error", err)
-			}
-		}
-	}
-}
-
-func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) error {
-	// Determine which mount points to monitor
-	level := forcedLevel
-
-	if level == monitor.LevelNone {
-		level = d.checkMounts()
-	}
-
-	if level == monitor.LevelNone {
-		return nil
-	}
-
-	// Convert monitor level to plugin level
-	pluginLevel := plugins.CleanupLevel(level)
-
-	// Run cleanup plugins
-	enabledPlugins := d.registry.GetEnabled(d.config)
-	d.logger.Debug("running plugins", "count", len(enabledPlugins))
-
-	var totalFreed int64
-	for _, p := range enabledPlugins {
-		if d.dryRun {
-			d.logger.Info("would run plugin", "plugin", p.Name(), "level", level.String())
-			continue
-		}
-
-		result := p.Cleanup(ctx, pluginLevel, d.config, d.logger)
-		if result.Error != nil {
-			d.logger.Error("plugin failed", "plugin", p.Name(), "error", result.Error)
-			continue
-		}
-
-		if result.BytesFreed > 0 || result.ItemsCleaned > 0 {
-			d.logger.Info("plugin completed",
-				"plugin", p.Name(),
-				"bytes_freed", result.BytesFreed,
-				"items_cleaned", result.ItemsCleaned,
-			)
-			totalFreed += result.BytesFreed
-		}
-	}
-
-	if !d.dryRun && totalFreed > 0 {
-		d.logger.Info("cleanup complete",
-			"total_freed_mb", totalFreed/(1024*1024),
-		)
-	}
-
-	return nil
-}
-
-// checkMounts monitors all configured mount points and returns the highest
-// cleanup level detected across all of them. Falls back to home directory
-// monitoring if no mounts are configured.
-func (d *daemon) checkMounts() monitor.CleanupLevel {
-	highestLevel := monitor.LevelNone
-
-	if len(d.config.MonitoredMounts) > 0 {
-		// Multi-mount monitoring: check each configured mount point
-		for _, mount := range d.config.MonitoredMounts {
-			stats, err := monitor.GetDiskStats(mount.Path)
-			if err != nil {
-				d.logger.Warn("failed to check mount", "path", mount.Path, "label", mount.Label, "error", err)
-				continue
-			}
-
-			// Use per-mount thresholds if configured, otherwise use global
-			mountMonitor := d.monitor
-			if mount.ThresholdWarning > 0 || mount.ThresholdCritical > 0 {
-				warning := d.config.Thresholds.Warning
-				moderate := d.config.Thresholds.Moderate
-				aggressive := d.config.Thresholds.Aggressive
-				critical := d.config.Thresholds.Critical
-				if mount.ThresholdWarning > 0 {
-					warning = mount.ThresholdWarning
-				}
-				if mount.ThresholdCritical > 0 {
-					critical = mount.ThresholdCritical
-				}
-				mountMonitor = monitor.NewDiskMonitor(warning, moderate, aggressive, critical)
-			}
-
-			mountLevel := mountMonitor.CheckLevel(stats)
-			label := mount.Label
-			if label == "" {
-				label = mount.Path
-			}
-
-			d.logger.Info("disk status",
-				"mount", label,
-				"path", mount.Path,
-				"used_percent", fmt.Sprintf("%.1f%%", stats.UsedPercent),
-				"free_gb", fmt.Sprintf("%.1fGB", stats.FreeGB),
-				"level", mountLevel.String(),
-			)
-
-			if mountLevel > highestLevel {
-				highestLevel = mountLevel
-			}
-		}
-	} else {
-		// Fallback: monitor home directory (original behavior)
-		// On macOS, "/" is the sealed system volume, but user data is on /System/Volumes/Data
-		// Using $HOME ensures we monitor the volume where data actually lives
-		monitorPath := "/"
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			monitorPath = home
-		}
-
-		stats, detectedLevel, err := d.monitor.Check(monitorPath)
-		if err != nil {
-			d.logger.Error("failed to check disk", "error", err)
-			return monitor.LevelNone
-		}
-
-		d.logger.Info("disk status",
-			"used_percent", fmt.Sprintf("%.1f%%", stats.UsedPercent),
-			"free_gb", fmt.Sprintf("%.1fGB", stats.FreeGB),
-			"level", detectedLevel.String(),
-		)
-
-		highestLevel = detectedLevel
-	}
-
-	return highestLevel
 }
 
 func registerPlugins(registry *plugins.Registry) {
