@@ -604,10 +604,18 @@ func (p *LimaPlugin) compactDiskInPlace(ctx context.Context, vm *VMDiskInfo, cfg
 			return // Don't start a VM that wasn't running
 		}
 		logger.Info("restarting Lima VM after in-place compaction", "vm", vm.Name)
-		startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
+		startCtx, startCancel := context.WithTimeout(ctx, 15*time.Minute)
+		defer startCancel()
+		startCmd := exec.CommandContext(startCtx, "limactl", "start", vm.Name)
 		if output, err := safeCombinedOutput(startCmd); err != nil {
-			restartErr = fmt.Errorf("failed to restart VM after compaction: %w (output: %s)", err, string(output))
-			logger.Error("failed to restart VM after compaction", "vm", vm.Name, "error", err, "output", string(output))
+			// limactl start may timeout but VM could still be running
+			checkCmd := exec.CommandContext(ctx, "limactl", "list", vm.Name, "--format", "{{.Status}}")
+			if statusOut, checkErr := safeOutput(checkCmd); checkErr == nil && strings.TrimSpace(string(statusOut)) == "Running" {
+				logger.Info("VM is running despite limactl start timeout", "vm", vm.Name)
+			} else {
+				restartErr = fmt.Errorf("failed to restart VM after compaction: %w (output: %s)", err, string(output))
+				logger.Error("failed to restart VM after compaction", "vm", vm.Name, "error", err, "output", string(output))
+			}
 		}
 	}()
 
@@ -1028,9 +1036,16 @@ func (p *LimaPlugin) shrinkDiskInPlace(ctx context.Context, vm *VMDiskInfo, targ
 			return
 		}
 		logger.Info("restarting Lima VM after shrink (defer)", "vm", vm.Name)
-		startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
+		startCtx, startCancel := context.WithTimeout(ctx, 15*time.Minute)
+		defer startCancel()
+		startCmd := exec.CommandContext(startCtx, "limactl", "start", vm.Name)
 		if output, err := safeCombinedOutput(startCmd); err != nil {
-			logger.Error("failed to restart VM after shrink", "vm", vm.Name, "error", err, "output", string(output))
+			checkCmd := exec.CommandContext(ctx, "limactl", "list", vm.Name, "--format", "{{.Status}}")
+			if statusOut, checkErr := safeOutput(checkCmd); checkErr == nil && strings.TrimSpace(string(statusOut)) == "Running" {
+				logger.Info("VM is running despite limactl start timeout", "vm", vm.Name)
+			} else {
+				logger.Error("failed to restart VM after shrink", "vm", vm.Name, "error", err, "output", string(output))
+			}
 		}
 	}()
 
@@ -1042,14 +1057,12 @@ func (p *LimaPlugin) shrinkDiskInPlace(ctx context.Context, vm *VMDiskInfo, targ
 	}
 	logger.Info("hole punch complete", "vm", vm.Name, "holes_freed_gb", fmt.Sprintf("%.1f", float64(holesFreed)/(1024*1024*1024)))
 
-	// Step 4: Truncate with qemu-img resize --shrink (ftruncate on raw, no copy)
-	resizeArg := fmt.Sprintf("%dG", targetGB)
-	logger.Info("truncating raw disk", "vm", vm.Name, "target", resizeArg)
-	resizeCmd := exec.CommandContext(ctx, "qemu-img", "resize", "--shrink", vm.DiskPath, resizeArg)
-	if output, err := safeCombinedOutput(resizeCmd); err != nil {
-		logger.Warn("qemu-img resize --shrink failed", "vm", vm.Name, "error", err, "output", string(output))
-		// Non-fatal: hole punching already freed space. Continue to restart.
-	}
+	// Step 4: Skip truncation — limactl start always restores the disk size from
+	// the Lima config (e.g. "Resize instance's disk from 13GiB to 40GiB"), so
+	// qemu-img resize --shrink is immediately undone. The hole punching in step 3
+	// already freed the actual host disk blocks, which is what matters for a sparse file.
+	logger.Info("skipping truncation (limactl start restores config disk size)",
+		"vm", vm.Name, "target_gb", targetGB, "holes_freed_gb", fmt.Sprintf("%.1f", float64(holesFreed)/(1024*1024*1024)))
 
 	// Step 5: Get host size after
 	hostSizeAfter, err := fsops.GetActualSize(vm.DiskPath)
@@ -1059,11 +1072,23 @@ func (p *LimaPlugin) shrinkDiskInPlace(ctx context.Context, vm *VMDiskInfo, targ
 	}
 
 	// Step 6: Restart VM
+	// krunkit VMs can take 10+ minutes to boot; limactl start has an internal
+	// ~10min SSH timeout that may be exceeded. We give it 15 minutes, and if
+	// limactl exits non-zero we verify the VM status directly.
 	logger.Info("restarting Lima VM after shrink", "vm", vm.Name)
 	vmRestarted = true
-	startCmd := exec.CommandContext(ctx, "limactl", "start", vm.Name)
+	startCtx, startCancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer startCancel()
+	startCmd := exec.CommandContext(startCtx, "limactl", "start", vm.Name)
 	if output, startErr := safeCombinedOutput(startCmd); startErr != nil {
-		logger.Error("failed to restart VM after shrink", "vm", vm.Name, "error", startErr, "output", string(output))
+		// limactl start may fail with SSH timeout but the VM could still be starting.
+		// Check actual status before declaring failure.
+		checkCmd := exec.CommandContext(ctx, "limactl", "list", vm.Name, "--format", "{{.Status}}")
+		if statusOut, checkErr := safeOutput(checkCmd); checkErr == nil && strings.TrimSpace(string(statusOut)) == "Running" {
+			logger.Info("VM is running despite limactl start timeout", "vm", vm.Name)
+		} else {
+			logger.Error("failed to restart VM after shrink", "vm", vm.Name, "error", startErr, "output", string(output))
+		}
 	}
 
 	// Step 7: Resize guest filesystem if needed (ignore errors - fs may auto-resize)
