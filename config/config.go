@@ -144,6 +144,9 @@ type LimaConfig struct {
 	DynamicResizeMinCooldownHours int `yaml:"dynamic_resize_min_cooldown_hours"`
 	// DynamicResizeHeadroomGB is GB of free space to preserve after resize (default: 5)
 	DynamicResizeHeadroomGB int `yaml:"dynamic_resize_headroom_gb"`
+	// DynamicResizeAllowK8s allows resize even when Kubernetes is detected inside the VM.
+	// K8s will be temporarily unavailable during the stop/resize/restart cycle.
+	DynamicResizeAllowK8s bool `yaml:"dynamic_resize_allow_k8s"`
 }
 
 // PodmanConfig holds Podman-specific cleanup settings.

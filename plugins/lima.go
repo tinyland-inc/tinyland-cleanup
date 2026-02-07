@@ -719,10 +719,15 @@ func (p *LimaPlugin) dynamicResize(ctx context.Context, vm *VMDiskInfo, cfg *con
 
 	// Check for Kubernetes workloads running inside the VM
 	if p.isKubernetesRunning(ctx, vm.Name, logger) {
-		logger.Warn("dynamic resize skipped: Kubernetes detected inside VM",
+		if !cfg.Lima.DynamicResizeAllowK8s {
+			logger.Warn("dynamic resize skipped: Kubernetes detected inside VM",
+				"vm", vm.Name,
+				"hint", "set dynamic_resize_allow_k8s: true to allow resize with K8s running")
+			return 0, nil
+		}
+		logger.Warn("dynamic resize proceeding despite Kubernetes running inside VM",
 			"vm", vm.Name,
-			"hint", "drain the node or stop K8s before enabling dynamic resize")
-		return 0, nil
+			"note", "K8s will be temporarily unavailable during resize")
 	}
 
 	// Calculate target size
