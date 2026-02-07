@@ -574,18 +574,34 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 
 // Helper functions
 
+// getDirSize returns the total size of files in a directory tree.
+// Uses a 30-second timeout to prevent hangs on unresponsive filesystems
+// (APFS snapshots, iCloud-synced paths, network mounts).
 func getDirSize(path string) int64 {
-	var size int64
-	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
+	type result struct {
+		size int64
+	}
+	ch := make(chan result, 1)
+	go func() {
+		var size int64
+		filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() {
+				size += info.Size()
+			}
 			return nil
-		}
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return nil
-	})
-	return size
+		})
+		ch <- result{size}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.size
+	case <-time.After(30 * time.Second):
+		return 0 // timeout - filesystem unresponsive
+	}
 }
 
 func deleteOldFiles(dir string, maxAge time.Duration) {
