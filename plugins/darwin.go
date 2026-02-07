@@ -95,31 +95,52 @@ func (p *HomebrewPlugin) cleanupPrune(ctx context.Context, logger *slog.Logger) 
 	result := CleanupResult{Plugin: p.Name(), Level: LevelModerate}
 
 	logger.Debug("running brew cleanup --prune=0")
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	pruneCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "brew", "cleanup", "--prune=0")
-	output, _ := cmd.CombinedOutput()
+	// Use Run() instead of CombinedOutput() to avoid pipe-inheritance blocking.
+	// If brew forks children that inherit stdout/stderr pipes, CombinedOutput()
+	// blocks forever waiting for the pipe to close even after brew exits.
+	// Calculate bytes freed via Homebrew cache size diff instead.
+	home, _ := os.UserHomeDir()
+	cachePath := filepath.Join(home, "Library", "Caches", "Homebrew")
+	sizeBefore := getDirSize(cachePath)
 
-	// Parse "Removing: /path/to/file... (X.X MB)"
-	result.BytesFreed = parseBrewCleanupOutput(string(output))
+	cmd := exec.CommandContext(pruneCtx, "brew", "cleanup", "--prune=0")
+	if err := cmd.Run(); err != nil {
+		logger.Debug("brew cleanup --prune=0 completed with error", "error", err)
+	}
+
+	sizeAfter := getDirSize(cachePath)
+	result.BytesFreed = safeBytesDiff(sizeBefore, sizeAfter)
 	return result
 }
 
 func (p *HomebrewPlugin) cleanupCritical(ctx context.Context, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name(), Level: LevelCritical}
 
-	// First autoremove unused dependencies
+	home, _ := os.UserHomeDir()
+	cachePath := filepath.Join(home, "Library", "Caches", "Homebrew")
+	sizeBefore := getDirSize(cachePath)
+
+	// First autoremove unused dependencies (5 min timeout)
 	logger.Warn("CRITICAL: running brew autoremove")
-	autoremoveCmd := exec.CommandContext(ctx, "brew", "autoremove")
+	autoCtx, autoCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer autoCancel()
+	autoremoveCmd := exec.CommandContext(autoCtx, "brew", "autoremove")
 	autoremoveCmd.Run()
 
-	// Then full cleanup
+	// Then full cleanup (10 min timeout, Run() to avoid pipe-inheritance hang)
 	logger.Warn("CRITICAL: running brew cleanup --prune=0")
-	cleanupCmd := exec.CommandContext(ctx, "brew", "cleanup", "--prune=0")
-	output, _ := cleanupCmd.CombinedOutput()
+	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cleanupCancel()
+	cleanupCmd := exec.CommandContext(cleanupCtx, "brew", "cleanup", "--prune=0")
+	if err := cleanupCmd.Run(); err != nil {
+		logger.Debug("brew cleanup --prune=0 completed with error", "error", err)
+	}
 
-	result.BytesFreed = parseBrewCleanupOutput(string(output))
+	sizeAfter := getDirSize(cachePath)
+	result.BytesFreed = safeBytesDiff(sizeBefore, sizeAfter)
 	return result
 }
 
