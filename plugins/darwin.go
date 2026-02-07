@@ -649,7 +649,10 @@ func parseBrewCleanupOutput(output string) int64 {
 // =============================================================================
 
 // ICloudPlugin handles iCloud Drive eviction operations.
-type ICloudPlugin struct{}
+type ICloudPlugin struct {
+	consecutiveFailures int
+	lastFailureTime     time.Time
+}
 
 // NewICloudPlugin creates a new iCloud eviction plugin.
 func NewICloudPlugin() *ICloudPlugin {
@@ -697,9 +700,12 @@ func (p *ICloudPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 		return result
 	}
 
-	// Preflight checks
-	if err := p.preflightChecks(logger); err != nil {
-		logger.Warn("iCloud preflight checks failed", "error", err)
+	// Circuit breaker: if eviction has failed 3+ times consecutively,
+	// back off for 1 hour to avoid wasting cycles on brctl hangs.
+	if p.consecutiveFailures >= 3 && time.Since(p.lastFailureTime) < 1*time.Hour {
+		logger.Debug("iCloud plugin circuit breaker open",
+			"failures", p.consecutiveFailures,
+			"cooldown_remaining", time.Until(p.lastFailureTime.Add(1*time.Hour)).Round(time.Second))
 		return result
 	}
 
@@ -717,31 +723,13 @@ func (p *ICloudPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 		maxAge = 24 * time.Hour // 1 day
 	}
 
-	// Evict files
+	// Evict files directly - brctl evict per-file is more reliable than
+	// brctl status as a preflight check. brctl status hangs under launchd
+	// daemon contexts due to XPC bootstrap namespace issues with the bird daemon.
 	result = p.evictFiles(ctx, iCloudPath, maxAge, cfg, logger)
 	result.Level = level
 
 	return result
-}
-
-// preflightChecks verifies iCloud eviction can proceed safely.
-func (p *ICloudPlugin) preflightChecks(logger *slog.Logger) error {
-	// Check if "Optimize Mac Storage" is enabled
-	// brctl can hang indefinitely if CloudKit is unresponsive, so use a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "brctl", "status")
-	output, err := safeCombinedOutput(cmd)
-	if err != nil {
-		return fmt.Errorf("brctl status failed: %w", err)
-	}
-
-	// If status contains any mention of iCloud, we're OK
-	if !strings.Contains(string(output), "iCloud") {
-		logger.Debug("iCloud may not be configured properly")
-	}
-
-	return nil
 }
 
 // reportICloudUsage reports iCloud Drive usage without evicting.
@@ -793,11 +781,14 @@ func (p *ICloudPlugin) isFileDownloaded(path string) bool {
 }
 
 // evictFiles evicts iCloud files older than maxAge.
+// Tracks consecutive failures for the circuit breaker: resets on any success,
+// increments on a cycle with zero successful evictions.
 func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge time.Duration, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name()}
 
 	cutoff := time.Now().Add(-maxAge)
 	minSize := int64(cfg.ICloud.MinFileSizeMB) * 1024 * 1024
+	var evictErrors int
 
 	filepath.Walk(iCloudPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -828,6 +819,7 @@ func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge
 
 		// Evict the file
 		if err := p.evictFile(ctx, path); err != nil {
+			evictErrors++
 			logger.Debug("failed to evict file", "path", filepath.Base(path), "error", err)
 		} else {
 			result.BytesFreed += info.Size()
@@ -838,6 +830,17 @@ func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge
 		return nil
 	})
 
+	// Update circuit breaker: reset on any success, increment on all-fail
+	if result.ItemsCleaned > 0 {
+		p.consecutiveFailures = 0
+	} else if evictErrors > 0 {
+		p.consecutiveFailures++
+		p.lastFailureTime = time.Now()
+		logger.Warn("iCloud eviction cycle failed",
+			"errors", evictErrors,
+			"consecutive_failures", p.consecutiveFailures)
+	}
+
 	if result.BytesFreed > 0 {
 		logger.Info("iCloud eviction complete",
 			"files_evicted", result.ItemsCleaned,
@@ -847,10 +850,14 @@ func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge
 	return result
 }
 
-// evictFile evicts a single iCloud file.
+// evictFile evicts a single iCloud file with a per-file timeout.
+// brctl evict can hang under launchd daemon contexts, so we cap each call.
 func (p *ICloudPlugin) evictFile(ctx context.Context, path string) error {
-	cmd := exec.CommandContext(ctx, "brctl", "evict", path)
-	return cmd.Run()
+	evictCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(evictCtx, "brctl", "evict", path)
+	_, err := safeCombinedOutput(cmd)
+	return err
 }
 
 // =============================================================================
