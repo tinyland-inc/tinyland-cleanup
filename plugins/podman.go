@@ -220,6 +220,27 @@ func (p *PodmanPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name(), Level: LevelCritical}
 
+	// When ProtectRunningContainers is false, stop all running containers
+	// first so their images and volumes can be reclaimed by the prune.
+	if !cfg.Podman.ProtectRunningContainers {
+		running := p.listRunningContainerIDs(ctx)
+		if len(running) > 0 {
+			logger.Warn("CRITICAL: stopping running containers for cleanup",
+				"count", len(running))
+			if _, err := p.runPodmanCommand(ctx,
+				append([]string{"stop", "--time", "10"}, running...)...); err != nil {
+				logger.Warn("failed to stop some containers", "error", err)
+			}
+		}
+	} else {
+		running := p.listRunningContainerIDs(ctx)
+		if len(running) > 0 {
+			logger.Info("protecting running containers from cleanup",
+				"count", len(running),
+				"hint", "set podman.protect_running_containers=false to allow stopping")
+		}
+	}
+
 	// Full system prune with volumes
 	logger.Warn("CRITICAL: running full Podman system prune with volumes")
 	output, err := p.runPodmanCommand(ctx, "system", "prune", "-af", "--volumes")
@@ -697,4 +718,17 @@ func (p *PodmanPlugin) cleanInsideVM(ctx context.Context, level CleanupLevel, lo
 	}
 
 	return result
+}
+
+// listRunningContainerIDs returns the IDs of all currently running Podman containers.
+func (p *PodmanPlugin) listRunningContainerIDs(ctx context.Context) []string {
+	output, err := p.runPodmanCommand(ctx, "ps", "-q", "--no-trunc")
+	if err != nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
 }

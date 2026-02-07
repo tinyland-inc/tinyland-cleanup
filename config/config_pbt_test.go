@@ -184,10 +184,8 @@ func TestPodmanConfigDefaults(t *testing.T) {
 		t.Error("Podman.PruneImagesAge should have a default")
 	}
 
-	// MachineNames should have at least one entry on Darwin
-	// (but we can't check runtime.GOOS in test, so just verify it's set)
-	if len(cfg.Podman.MachineNames) == 0 {
-		t.Error("Podman.MachineNames should have defaults")
+	if !cfg.Podman.ProtectRunningContainers {
+		t.Error("Podman.ProtectRunningContainers should default to true")
 	}
 }
 

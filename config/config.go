@@ -140,10 +140,8 @@ type LimaConfig struct {
 type PodmanConfig struct {
 	// PruneImagesAge for images older than this duration
 	PruneImagesAge string `yaml:"prune_images_age"`
-	// ProtectRunningContainers prevents pruning images used by running containers
+	// ProtectRunningContainers prevents stopping running containers during critical cleanup
 	ProtectRunningContainers bool `yaml:"protect_running_containers"`
-	// MachineNames to check for cleanup (Darwin)
-	MachineNames []string `yaml:"machine_names"`
 	// CleanInsideVM enables cleanup inside Podman machine VM (Darwin)
 	CleanInsideVM bool `yaml:"clean_inside_vm"`
 	// TrimVMDisk enables fstrim inside VM to reclaim sparse disk space (Darwin)
@@ -244,7 +242,6 @@ func DefaultConfig() *Config {
 		Podman: PodmanConfig{
 			PruneImagesAge:           "24h",
 			ProtectRunningContainers: true,
-			MachineNames:             []string{"podman-machine-default"},
 			CleanInsideVM:            true,
 			TrimVMDisk:               true,
 		},
