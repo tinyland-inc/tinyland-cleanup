@@ -1,0 +1,121 @@
+# CI/CD Pipeline for tinyland-cleanup
+# Self-contained - no external template includes needed
+
+stages:
+  - check
+  - build
+  - test
+  - cache
+
+variables:
+  ATTIC_SERVER: "https://nix-cache.fuzzy-dev.tinyland.dev"
+  ATTIC_CACHE: "tinyland-cleanup"
+  ATTIC_PUBLIC_KEY: "tinyland-lab:DYGxhyE9HSMLJDQYjWRSTDmgO2HHd6Sm+a5qaO2RwnQ="
+
+# Nix flake check (fast eval)
+check:flake:
+  image: nixos/nix:2.24.9
+  stage: check
+  tags: [tinyland, docker]
+  timeout: 5 minutes
+  variables:
+    NIX_CONFIG: "experimental-features = nix-command flakes"
+  before_script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+  script:
+    - nix flake check --no-build
+    - nix flake metadata --json | head -20
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_MERGE_REQUEST_ID
+
+# Multi-arch builds
+.build_base:
+  image: nixos/nix:2.24.9
+  stage: build
+  timeout: 20 minutes
+  variables:
+    NIX_CONFIG: |
+      experimental-features = nix-command flakes
+      extra-substituters = ${ATTIC_SERVER}/${ATTIC_CACHE} ${ATTIC_SERVER}/main https://cache.nixos.org
+      extra-trusted-public-keys = ${ATTIC_PUBLIC_KEY} main:PBDvqG8OP3W2XF4QzuqWwZD/RhLRsE7ONxwM09kqTtw= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+      connect-timeout = 5
+      fallback = true
+  before_script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+/
+
+build:x86_64-linux:
+  extends: .build_base
+  tags: [tinyland, nix, shell, x86_64-linux]
+  script:
+    - nix build .#packages.x86_64-linux.default -o result-x86_64-linux --print-build-logs
+    - result-x86_64-linux/bin/tinyland-cleanup --version
+  artifacts:
+    paths: [result-x86_64-linux]
+    expire_in: 1 day
+
+build:aarch64-darwin:
+  extends: .build_base
+  tags: [tinyland, darwin-native]
+  script:
+    - nix build .#packages.aarch64-darwin.default -o result-aarch64-darwin --print-build-logs
+    - result-aarch64-darwin/bin/tinyland-cleanup --version
+  artifacts:
+    paths: [result-aarch64-darwin]
+    expire_in: 1 day
+
+# Go tests
+test:go:
+  image: golang:1.23-alpine
+  stage: test
+  tags: [docker]
+  script:
+    - go test -v -race -count=1 ./...
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_MERGE_REQUEST_ID
+
+# Attic cache push
+cache:attic:
+  image: nixos/nix:2.24.9
+  stage: cache
+  tags: [tinyland, docker]
+  timeout: 10 minutes
+  variables:
+    NIX_CONFIG: "experimental-features = nix-command flakes"
+  before_script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - |
+      if [ -n "$ATTIC_TOKEN" ]; then
+        nix profile install nixpkgs#attic-client 2>/dev/null || nix-env -iA nixpkgs.attic-client || true
+        mkdir -p ~/.config/attic
+        cat > ~/.config/attic/config.toml << EOF
+      [servers.default]
+      endpoint = "${ATTIC_SERVER}"
+      token = "${ATTIC_TOKEN}"
+      EOF
+      fi
+  script:
+    - |
+      if [ -z "$ATTIC_TOKEN" ]; then
+        echo "ATTIC_TOKEN not set, skipping cache push"
+        exit 0
+      fi
+      for result in result-*; do
+        [ -e "$result" ] && attic push "${ATTIC_CACHE}" "$result" --jobs 4 || true
+      done
+  needs:
+    - job: build:x86_64-linux
+      optional: true
+      artifacts: true
+    - job: build:aarch64-darwin
+      optional: true
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+/
+  allow_failure: true
