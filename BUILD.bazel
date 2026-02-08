@@ -1,0 +1,4 @@
+load("@gazelle//:def.bzl", "gazelle")
+
+# gazelle:prefix gitlab.com/tinyland/projects/tinyland-cleanup
+gazelle(name = "gazelle")

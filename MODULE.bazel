@@ -1,0 +1,71 @@
+# =============================================================================
+# MODULE.bazel - Bazel Module for tinyland-cleanup
+# =============================================================================
+# Standalone Bazel module for cross-platform disk cleanup daemon.
+# Uses rules_nixpkgs for hermetic Go toolchain from Nix.
+#
+# Usage:
+#   bazel build //...
+#   bazel test //...
+#   bazel run //:gazelle    # Regenerate BUILD files
+# =============================================================================
+
+module(
+    name = "tinyland_cleanup",
+    version = "0.2.0",
+    compatibility_level = 1,
+)
+
+# Core dependencies
+bazel_dep(name = "rules_nixpkgs_core", version = "0.12.0")
+bazel_dep(name = "rules_nixpkgs_go", version = "0.12.0")
+bazel_dep(name = "rules_nixpkgs_cc", version = "0.12.0")
+bazel_dep(name = "rules_go", version = "0.46.0")
+bazel_dep(name = "rules_cc", version = "0.0.9")
+bazel_dep(name = "bazel_skylib", version = "1.5.0")
+bazel_dep(name = "platforms", version = "0.0.8")
+bazel_dep(name = "gazelle", version = "0.37.0")
+
+# =============================================================================
+# Nix Toolchains
+# =============================================================================
+
+nixpkgs = use_extension("@rules_nixpkgs_core//extensions:nixpkgs.bzl", "nixpkgs")
+nixpkgs.default(name = "nixpkgs", nix_file_content = """
+    import (builtins.fetchTarball {
+        name = "nixpkgs-24.11";
+        url = "https://github.com/NixOS/nixpkgs/archive/nixos-24.11.tar.gz";
+    }) {}
+""")
+use_repo(nixpkgs, "nixpkgs")
+
+# Go toolchain from Nix (Go 1.23)
+nixpkgs_go = use_extension("@rules_nixpkgs_go//extensions:go.bzl", "nixpkgs_go")
+nixpkgs_go.configure(
+    name = "nixpkgs_go_toolchain",
+    repository = "@nixpkgs",
+    attribute_path = "go_1_23",
+)
+use_repo(nixpkgs_go, "nixpkgs_go_toolchain")
+register_toolchains("@nixpkgs_go_toolchain//:toolchain")
+
+# C/C++ toolchain from Nix (required for cgo)
+nixpkgs_cc = use_extension("@rules_nixpkgs_cc//extensions:cc.bzl", "nixpkgs_cc")
+nixpkgs_cc.configure(
+    name = "nixpkgs_cc_toolchain",
+    repository = "@nixpkgs",
+)
+use_repo(nixpkgs_cc, "nixpkgs_cc_toolchain")
+register_toolchains("@nixpkgs_cc_toolchain//:toolchain")
+
+# =============================================================================
+# Go Dependencies
+# =============================================================================
+
+# Go SDK version from go.mod
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.from_file(go_mod = "//:go.mod")
+
+# Go deps managed by Gazelle
+go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
+go_deps.from_file(go_mod = "//:go.mod")
