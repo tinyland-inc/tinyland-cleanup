@@ -54,14 +54,9 @@ func (p *NixPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config
 	}
 
 	switch level {
-	case LevelWarning:
-		// Warning: nix-collect-garbage without -d (keeps generations)
+	case LevelWarning, LevelModerate:
+		// Light/moderate: just nix-collect-garbage (no -d flag)
 		result = p.collectGarbage(ctx, false, logger)
-	case LevelModerate:
-		// Moderate: nix-collect-garbage -d (delete old generations)
-		// Without -d, old generations keep all store paths referenced,
-		// making GC a no-op when many generations exist (e.g. 23G /nix/store).
-		result = p.collectGarbage(ctx, true, logger)
 	case LevelAggressive:
 		// Aggressive: nix-collect-garbage -d (delete old generations)
 		result = p.collectGarbage(ctx, true, logger)
@@ -93,7 +88,7 @@ func (p *NixPlugin) collectGarbage(ctx context.Context, deleteOldGenerations boo
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nix-collect-garbage", args...)
-	output, err := safeCombinedOutput(cmd)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		result.Error = err
 		return result
@@ -124,7 +119,7 @@ func (p *NixPlugin) collectGarbageCritical(ctx context.Context, logger *slog.Log
 	defer cancel()
 
 	cmd := exec.CommandContext(optimizeCtx, "nix-store", "--optimize")
-	output, err := safeCombinedOutput(cmd)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		logger.Error("nix-store --optimize failed", "error", err, "output", string(output))
 		// Don't fail the whole operation for optimize failure

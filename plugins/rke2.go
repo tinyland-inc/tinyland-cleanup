@@ -183,7 +183,7 @@ func (p *RKE2Plugin) cleanModerate(ctx context.Context, cfg *config.Config, logg
 
 	// Use ctr to prune images in the k8s.io namespace
 	cmd := exec.CommandContext(ctx, "ctr", "-a", socket, "-n", "k8s.io", "images", "prune")
-	output, err := safeCombinedOutput(cmd)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		logger.Debug("ctr image prune failed", "error", err, "output", string(output))
 	} else {
@@ -225,11 +225,11 @@ func (p *RKE2Plugin) cleanCritical(ctx context.Context, logger *slog.Logger) Cle
 	// Remove all unused images (more aggressive)
 	// This is similar to 'crictl rmi --prune' but using ctr directly
 	cmd := exec.CommandContext(ctx, "ctr", "-a", socket, "-n", "k8s.io", "images", "prune", "--all")
-	output, err := safeCombinedOutput(cmd)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Try without --all flag
 		cmd = exec.CommandContext(ctx, "ctr", "-a", socket, "-n", "k8s.io", "images", "prune")
-		output, err = safeCombinedOutput(cmd)
+		output, err = cmd.CombinedOutput()
 	}
 
 	if err == nil {

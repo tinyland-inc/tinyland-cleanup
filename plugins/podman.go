@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
-	"gitlab.com/tinyland/lab/tinyland-cleanup/pkg/fsops"
 )
 
 // PodmanPlugin handles Podman cleanup operations.
@@ -194,23 +193,13 @@ func (p *PodmanPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 
 	// On Darwin, run fstrim inside VM to reclaim sparse disk space
 	if runtime.GOOS == "darwin" && p.environment.VMRunning && cfg.Podman.TrimVMDisk {
-		// applehv with raw disk images: fstrim marks blocks unused inside the
-		// guest but Apple's Virtualization.framework does NOT hole-punch the
-		// host raw file. Only offline compaction via qemu-img can shrink it.
-		if p.environment.VMProvider == "applehv" {
-			logger.Warn("fstrim has no host-side effect on applehv raw disks; "+
-				"enable podman.compact_disk_offline for actual reclamation",
-				"machine", p.environment.MachineName,
-				"provider", p.environment.VMProvider)
-		} else {
-			logger.Debug("running fstrim in Podman VM", "machine", p.environment.MachineName)
-			if trimmed, err := p.trimVMDisk(ctx, logger); err == nil && trimmed > 0 {
-				result.BytesFreed += trimmed
-				result.ItemsCleaned++
-				logger.Info("reclaimed sparse disk space from Podman VM", "freed_mb", trimmed/(1024*1024))
-			} else if err != nil {
-				logger.Warn("fstrim in Podman VM failed", "error", err)
-			}
+		logger.Debug("running fstrim in Podman VM", "machine", p.environment.MachineName)
+		if trimmed, err := p.trimVMDisk(ctx, logger); err == nil && trimmed > 0 {
+			result.BytesFreed += trimmed
+			result.ItemsCleaned++
+			logger.Info("reclaimed sparse disk space from Podman VM", "freed_mb", trimmed/(1024*1024))
+		} else if err != nil {
+			logger.Warn("fstrim in Podman VM failed", "error", err)
 		}
 	}
 
@@ -220,27 +209,6 @@ func (p *PodmanPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 // cleanCritical performs emergency cleanup: full system prune with volumes and external cleanup.
 func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name(), Level: LevelCritical}
-
-	// When ProtectRunningContainers is false, stop all running containers
-	// first so their images and volumes can be reclaimed by the prune.
-	if !cfg.Podman.ProtectRunningContainers {
-		running := p.listRunningContainerIDs(ctx)
-		if len(running) > 0 {
-			logger.Warn("CRITICAL: stopping running containers for cleanup",
-				"count", len(running))
-			if _, err := p.runPodmanCommand(ctx,
-				append([]string{"stop", "--time", "10"}, running...)...); err != nil {
-				logger.Warn("failed to stop some containers", "error", err)
-			}
-		}
-	} else {
-		running := p.listRunningContainerIDs(ctx)
-		if len(running) > 0 {
-			logger.Info("protecting running containers from cleanup",
-				"count", len(running),
-				"hint", "set podman.protect_running_containers=false to allow stopping")
-		}
-	}
 
 	// Full system prune with volumes
 	logger.Warn("CRITICAL: running full Podman system prune with volumes")
@@ -283,7 +251,7 @@ func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, lo
 
 		// Offline disk compaction (opt-in only)
 		if cfg.Podman.CompactDiskOffline {
-			compactFreed, err := p.compactRawDiskInPlace(ctx, cfg, logger)
+			compactFreed, err := p.compactRawDisk(ctx, logger)
 			if err != nil {
 				logger.Warn("Podman disk compaction failed", "error", err)
 			} else if compactFreed > 0 {
@@ -305,7 +273,7 @@ func (p *PodmanPlugin) runPodmanCommand(ctx context.Context, args ...string) (st
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "podman", args...)
-	output, err := safeCombinedOutput(cmd)
+	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
 
@@ -405,7 +373,7 @@ func detectMachineProvider() string {
 // detectRunningMachine detects if a Podman machine is running and returns its name.
 func detectRunningMachine() (bool, string) {
 	cmd := exec.Command("podman", "machine", "list", "--format", "{{.Name}}\t{{.Running}}")
-	output, err := safeOutput(cmd)
+	output, err := cmd.Output()
 	if err != nil {
 		return false, ""
 	}
@@ -463,7 +431,7 @@ func (p *PodmanPlugin) trimVMDisk(ctx context.Context, logger *slog.Logger) (int
 
 	cmd := exec.CommandContext(ctx, "podman", "machine", "ssh",
 		p.environment.MachineName, "--", "sudo", "fstrim", "-av")
-	output, err := safeCombinedOutput(cmd)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("fstrim failed: %w", err)
 	}
@@ -486,126 +454,11 @@ func parseFstrimOutput(output string) int64 {
 	return total
 }
 
-// compactRawDiskInPlace performs in-place disk compaction for the Podman machine VM.
-// Zero-fills free space inside the running VM, stops the machine, then uses hole-punching
-// to convert the zero regions into sparse holes on the host filesystem.
-// This approach requires NO extra disk space (unlike the legacy qemu-img convert method).
-func (p *PodmanPlugin) compactRawDiskInPlace(ctx context.Context, cfg *config.Config, logger *slog.Logger) (int64, error) {
-	if !p.environment.VMRunning || p.environment.MachineName == "" {
-		return 0, nil
-	}
-
-	// If config requests legacy copy method, delegate to old implementation
-	if cfg.Podman.CompactMethod == "copy" {
-		logger.Info("using legacy copy-based compaction (compact_method=copy)",
-			"machine", p.environment.MachineName)
-		return p.compactRawDiskLegacy(ctx, logger)
-	}
-
-	// qemu-img is still needed for format detection, not compaction
-	if _, err := exec.LookPath("qemu-img"); err != nil {
-		logger.Debug("qemu-img not available, proceeding without format detection")
-	}
-
-	// Get raw disk file path from podman machine inspect
-	diskPath, err := p.getMachineDiskPath(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("cannot determine disk path: %w", err)
-	}
-	if diskPath == "" {
-		return 0, fmt.Errorf("empty disk path for machine %s", p.environment.MachineName)
-	}
-
-	// Pre-flight: in-place operation needs 0 temp space
-	diskDir := filepath.Dir(diskPath)
-	preflight := PreflightOnlyShrink(diskDir, 0, &cfg.Safety)
-	if !preflight.Safe {
-		return 0, fmt.Errorf("preflight check failed: %s", preflight.Reason)
-	}
-
-	// Get actual disk size before (sparse-aware)
-	sizeBefore, err := fsops.GetActualSize(diskPath)
-	if err != nil {
-		return 0, fmt.Errorf("cannot get actual disk size: %w", err)
-	}
-
-	logger.Info("starting in-place Podman disk compaction",
-		"machine", p.environment.MachineName,
-		"disk", diskPath,
-		"actual_size_gb", fmt.Sprintf("%.1f", float64(sizeBefore)/(1024*1024*1024)))
-
-	// Step 1: Zero-fill free space inside the running VM
-	logger.Info("zero-filling free space inside Podman VM", "machine", p.environment.MachineName)
-	sshCmd := exec.CommandContext(ctx, "podman", "machine", "ssh",
-		p.environment.MachineName, "--",
-		"sh", "-c", "dd if=/dev/zero of=/tmp/_zero_fill bs=1M 2>/dev/null; sync; rm -f /tmp/_zero_fill")
-	if output, err := safeCombinedOutput(sshCmd); err != nil {
-		// dd will exit non-zero when disk is full (expected behavior)
-		logger.Debug("zero-fill completed (dd exits non-zero when disk full, this is expected)",
-			"output", string(output))
-	}
-
-	// Step 2: Stop machine (ALWAYS restart via defer)
-	logger.Warn("stopping Podman machine for hole-punching",
-		"machine", p.environment.MachineName)
-	stopCmd := exec.CommandContext(ctx, "podman", "machine", "stop", p.environment.MachineName)
-	if output, err := safeCombinedOutput(stopCmd); err != nil {
-		return 0, fmt.Errorf("failed to stop machine: %w (output: %s)", err, string(output))
-	}
-	p.environment.VMRunning = false
-
-	// ALWAYS restart the machine, even if hole-punching fails
-	defer func() {
-		logger.Info("restarting Podman machine after compaction", "machine", p.environment.MachineName)
-		startCmd := exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName)
-		if output, err := safeCombinedOutput(startCmd); err != nil {
-			logger.Error("failed to restart machine after compaction",
-				"machine", p.environment.MachineName, "error", err, "output", string(output))
-		}
-		p.environment.VMRunning = true
-	}()
-
-	// Step 3: In-place hole punching
-	logger.Info("punching holes in Podman VM disk image", "disk", diskPath)
-	holesFreed, err := fsops.CompactInPlace(diskPath, fsops.DefaultBlockSize)
-	if err != nil {
-		return 0, fmt.Errorf("in-place hole punching failed: %w", err)
-	}
-
-	// Get actual size after
-	sizeAfter, err := fsops.GetActualSize(diskPath)
-	if err != nil {
-		return holesFreed, fmt.Errorf("cannot get actual disk size after compaction: %w", err)
-	}
-
-	// Assert only-shrink invariant
-	if err := AssertOnlyShrink(sizeBefore, sizeAfter, "podman-compact-in-place"); err != nil {
-		logger.Error("ONLY-SHRINK violation detected", "error", err)
-		return 0, err
-	}
-
-	freed := sizeBefore - sizeAfter
-	if freed > 0 {
-		logger.Info("Podman in-place disk compaction complete",
-			"machine", p.environment.MachineName,
-			"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1024*1024*1024)),
-			"holes_freed_gb", fmt.Sprintf("%.1f", float64(holesFreed)/(1024*1024*1024)),
-			"before_gb", fmt.Sprintf("%.1f", float64(sizeBefore)/(1024*1024*1024)),
-			"after_gb", fmt.Sprintf("%.1f", float64(sizeAfter)/(1024*1024*1024)),
-		)
-		return freed, nil
-	}
-
-	logger.Info("Podman disk compaction found no reclaimable space",
-		"machine", p.environment.MachineName)
-	return 0, nil
-}
-
-// compactRawDiskLegacy performs offline disk compaction using qemu-img convert (copy method).
+// compactRawDisk performs offline disk compaction for the Podman machine VM.
 // For raw disk images (applehv, libkrun): creates a sparse copy via qemu-img.
 // For qcow2 (qemu): converts to reclaim space.
-// WARNING: requires 2x disk space for the temporary copy. Use compactRawDiskInPlace instead.
-func (p *PodmanPlugin) compactRawDiskLegacy(ctx context.Context, logger *slog.Logger) (int64, error) {
+// ONLY runs at Critical level with explicit opt-in via config.
+func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) (int64, error) {
 	if !p.environment.VMRunning || p.environment.MachineName == "" {
 		return 0, nil
 	}
@@ -664,7 +517,7 @@ func (p *PodmanPlugin) compactRawDiskLegacy(ctx context.Context, logger *slog.Lo
 
 	// 1. Stop machine
 	stopCmd := exec.CommandContext(ctx, "podman", "machine", "stop", p.environment.MachineName)
-	if output, err := safeCombinedOutput(stopCmd); err != nil {
+	if output, err := stopCmd.CombinedOutput(); err != nil {
 		return 0, fmt.Errorf("failed to stop machine: %w (output: %s)", err, string(output))
 	}
 	p.environment.VMRunning = false
@@ -673,7 +526,7 @@ func (p *PodmanPlugin) compactRawDiskLegacy(ctx context.Context, logger *slog.Lo
 	logger.Info("compacting Podman machine disk", "machine", p.environment.MachineName)
 	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert",
 		"-f", diskFormat, "-O", diskFormat, diskPath, sparsePath)
-	if output, err := safeCombinedOutput(convertCmd); err != nil {
+	if output, err := convertCmd.CombinedOutput(); err != nil {
 		os.Remove(sparsePath)
 		// Restart machine before returning
 		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
@@ -684,7 +537,7 @@ func (p *PodmanPlugin) compactRawDiskLegacy(ctx context.Context, logger *slog.Lo
 	// 3. Verify if qcow2 format
 	if diskFormat == "qcow2" {
 		checkCmd := exec.CommandContext(ctx, "qemu-img", "check", sparsePath)
-		if output, err := safeCombinedOutput(checkCmd); err != nil {
+		if output, err := checkCmd.CombinedOutput(); err != nil {
 			os.Remove(sparsePath)
 			exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
 			p.environment.VMRunning = true
@@ -712,7 +565,7 @@ func (p *PodmanPlugin) compactRawDiskLegacy(ctx context.Context, logger *slog.Lo
 	// 6. Restart machine
 	logger.Info("restarting Podman machine after compaction", "machine", p.environment.MachineName)
 	startCmd := exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName)
-	if output, err := safeCombinedOutput(startCmd); err != nil {
+	if output, err := startCmd.CombinedOutput(); err != nil {
 		logger.Error("failed to restart machine after compaction",
 			"machine", p.environment.MachineName, "error", err, "output", string(output))
 	}
@@ -736,7 +589,7 @@ func (p *PodmanPlugin) compactRawDiskLegacy(ctx context.Context, logger *slog.Lo
 func (p *PodmanPlugin) getMachineDiskPath(ctx context.Context) (string, error) {
 	// Strategy 1: Try podman machine inspect for ImagePath/DiskPath (older Podman)
 	cmd := exec.CommandContext(ctx, "podman", "machine", "inspect", p.environment.MachineName)
-	if output, err := safeOutput(cmd); err == nil {
+	if output, err := cmd.Output(); err == nil {
 		outputStr := string(output)
 		// Check for simple string value: "ImagePath": "/path/to/disk"
 		for _, key := range []string{"ImagePath", "DiskPath"} {
@@ -821,7 +674,7 @@ func (p *PodmanPlugin) cleanInsideVM(ctx context.Context, level CleanupLevel, lo
 	for _, args := range commands {
 		cmd := exec.CommandContext(ctx, "podman",
 			append([]string{"machine", "ssh", p.environment.MachineName, "--"}, args...)...)
-		output, err := safeCombinedOutput(cmd)
+		output, err := cmd.CombinedOutput()
 		if err != nil {
 			logger.Debug("VM cleanup command failed", "args", args, "error", err)
 			continue
@@ -834,17 +687,4 @@ func (p *PodmanPlugin) cleanInsideVM(ctx context.Context, level CleanupLevel, lo
 	}
 
 	return result
-}
-
-// listRunningContainerIDs returns the IDs of all currently running Podman containers.
-func (p *PodmanPlugin) listRunningContainerIDs(ctx context.Context) []string {
-	output, err := p.runPodmanCommand(ctx, "ps", "-q", "--no-trunc")
-	if err != nil {
-		return nil
-	}
-	trimmed := strings.TrimSpace(output)
-	if trimmed == "" {
-		return nil
-	}
-	return strings.Split(trimmed, "\n")
 }

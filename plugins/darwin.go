@@ -95,52 +95,31 @@ func (p *HomebrewPlugin) cleanupPrune(ctx context.Context, logger *slog.Logger) 
 	result := CleanupResult{Plugin: p.Name(), Level: LevelModerate}
 
 	logger.Debug("running brew cleanup --prune=0")
-	pruneCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	// Use Run() instead of CombinedOutput() to avoid pipe-inheritance blocking.
-	// If brew forks children that inherit stdout/stderr pipes, CombinedOutput()
-	// blocks forever waiting for the pipe to close even after brew exits.
-	// Calculate bytes freed via Homebrew cache size diff instead.
-	home, _ := os.UserHomeDir()
-	cachePath := filepath.Join(home, "Library", "Caches", "Homebrew")
-	sizeBefore := getDirSize(cachePath)
+	cmd := exec.CommandContext(ctx, "brew", "cleanup", "--prune=0")
+	output, _ := cmd.CombinedOutput()
 
-	cmd := exec.CommandContext(pruneCtx, "brew", "cleanup", "--prune=0")
-	if err := cmd.Run(); err != nil {
-		logger.Debug("brew cleanup --prune=0 completed with error", "error", err)
-	}
-
-	sizeAfter := getDirSize(cachePath)
-	result.BytesFreed = safeBytesDiff(sizeBefore, sizeAfter)
+	// Parse "Removing: /path/to/file... (X.X MB)"
+	result.BytesFreed = parseBrewCleanupOutput(string(output))
 	return result
 }
 
 func (p *HomebrewPlugin) cleanupCritical(ctx context.Context, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name(), Level: LevelCritical}
 
-	home, _ := os.UserHomeDir()
-	cachePath := filepath.Join(home, "Library", "Caches", "Homebrew")
-	sizeBefore := getDirSize(cachePath)
-
-	// First autoremove unused dependencies (5 min timeout)
+	// First autoremove unused dependencies
 	logger.Warn("CRITICAL: running brew autoremove")
-	autoCtx, autoCancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer autoCancel()
-	autoremoveCmd := exec.CommandContext(autoCtx, "brew", "autoremove")
+	autoremoveCmd := exec.CommandContext(ctx, "brew", "autoremove")
 	autoremoveCmd.Run()
 
-	// Then full cleanup (10 min timeout, Run() to avoid pipe-inheritance hang)
+	// Then full cleanup
 	logger.Warn("CRITICAL: running brew cleanup --prune=0")
-	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer cleanupCancel()
-	cleanupCmd := exec.CommandContext(cleanupCtx, "brew", "cleanup", "--prune=0")
-	if err := cleanupCmd.Run(); err != nil {
-		logger.Debug("brew cleanup --prune=0 completed with error", "error", err)
-	}
+	cleanupCmd := exec.CommandContext(ctx, "brew", "cleanup", "--prune=0")
+	output, _ := cleanupCmd.CombinedOutput()
 
-	sizeAfter := getDirSize(cachePath)
-	result.BytesFreed = safeBytesDiff(sizeBefore, sizeAfter)
+	result.BytesFreed = parseBrewCleanupOutput(string(output))
 	return result
 }
 
@@ -489,7 +468,7 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 	// Go build cache (moderate+, separate from module cache)
 	if level >= LevelModerate {
 		if _, err := exec.LookPath("go"); err == nil {
-			if output, err := safeOutput(exec.CommandContext(ctx, "go", "env", "GOCACHE")); err == nil {
+			if output, err := exec.CommandContext(ctx, "go", "env", "GOCACHE").Output(); err == nil {
 				goCacheDir := strings.TrimSpace(string(output))
 				if goCacheDir != "" && goCacheDir != "off" {
 					sizeBefore := getDirSize(goCacheDir)
@@ -540,7 +519,7 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 	// Rustup toolchain cleanup (critical only - keep default toolchain)
 	if level >= LevelCritical {
 		if _, err := exec.LookPath("rustup"); err == nil {
-			output, err := safeOutput(exec.CommandContext(ctx, "rustup", "toolchain", "list"))
+			output, err := exec.CommandContext(ctx, "rustup", "toolchain", "list").Output()
 			if err == nil {
 				for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 					line = strings.TrimSpace(line)
@@ -574,34 +553,18 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 
 // Helper functions
 
-// getDirSize returns the total size of files in a directory tree.
-// Uses a 30-second timeout to prevent hangs on unresponsive filesystems
-// (APFS snapshots, iCloud-synced paths, network mounts).
 func getDirSize(path string) int64 {
-	type result struct {
-		size int64
-	}
-	ch := make(chan result, 1)
-	go func() {
-		var size int64
-		filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if !info.IsDir() {
-				size += info.Size()
-			}
+	var size int64
+	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
 			return nil
-		})
-		ch <- result{size}
-	}()
-
-	select {
-	case r := <-ch:
-		return r.size
-	case <-time.After(30 * time.Second):
-		return 0 // timeout - filesystem unresponsive
-	}
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size
 }
 
 func deleteOldFiles(dir string, maxAge time.Duration) {
@@ -649,10 +612,7 @@ func parseBrewCleanupOutput(output string) int64 {
 // =============================================================================
 
 // ICloudPlugin handles iCloud Drive eviction operations.
-type ICloudPlugin struct {
-	consecutiveFailures int
-	lastFailureTime     time.Time
-}
+type ICloudPlugin struct{}
 
 // NewICloudPlugin creates a new iCloud eviction plugin.
 func NewICloudPlugin() *ICloudPlugin {
@@ -700,12 +660,9 @@ func (p *ICloudPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 		return result
 	}
 
-	// Circuit breaker: if eviction has failed 3+ times consecutively,
-	// back off for 1 hour to avoid wasting cycles on brctl hangs.
-	if p.consecutiveFailures >= 3 && time.Since(p.lastFailureTime) < 1*time.Hour {
-		logger.Debug("iCloud plugin circuit breaker open",
-			"failures", p.consecutiveFailures,
-			"cooldown_remaining", time.Until(p.lastFailureTime.Add(1*time.Hour)).Round(time.Second))
+	// Preflight checks
+	if err := p.preflightChecks(logger); err != nil {
+		logger.Warn("iCloud preflight checks failed", "error", err)
 		return result
 	}
 
@@ -723,13 +680,31 @@ func (p *ICloudPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *con
 		maxAge = 24 * time.Hour // 1 day
 	}
 
-	// Evict files directly - brctl evict per-file is more reliable than
-	// brctl status as a preflight check. brctl status hangs under launchd
-	// daemon contexts due to XPC bootstrap namespace issues with the bird daemon.
+	// Evict files
 	result = p.evictFiles(ctx, iCloudPath, maxAge, cfg, logger)
 	result.Level = level
 
 	return result
+}
+
+// preflightChecks verifies iCloud eviction can proceed safely.
+func (p *ICloudPlugin) preflightChecks(logger *slog.Logger) error {
+	// Check if "Optimize Mac Storage" is enabled
+	// brctl can hang indefinitely if CloudKit is unresponsive, so use a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "brctl", "status")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("brctl status failed: %w", err)
+	}
+
+	// If status contains any mention of iCloud, we're OK
+	if !strings.Contains(string(output), "iCloud") {
+		logger.Debug("iCloud may not be configured properly")
+	}
+
+	return nil
 }
 
 // reportICloudUsage reports iCloud Drive usage without evicting.
@@ -781,14 +756,11 @@ func (p *ICloudPlugin) isFileDownloaded(path string) bool {
 }
 
 // evictFiles evicts iCloud files older than maxAge.
-// Tracks consecutive failures for the circuit breaker: resets on any success,
-// increments on a cycle with zero successful evictions.
 func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge time.Duration, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name()}
 
 	cutoff := time.Now().Add(-maxAge)
 	minSize := int64(cfg.ICloud.MinFileSizeMB) * 1024 * 1024
-	var evictErrors int
 
 	filepath.Walk(iCloudPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -819,7 +791,6 @@ func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge
 
 		// Evict the file
 		if err := p.evictFile(ctx, path); err != nil {
-			evictErrors++
 			logger.Debug("failed to evict file", "path", filepath.Base(path), "error", err)
 		} else {
 			result.BytesFreed += info.Size()
@@ -830,17 +801,6 @@ func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge
 		return nil
 	})
 
-	// Update circuit breaker: reset on any success, increment on all-fail
-	if result.ItemsCleaned > 0 {
-		p.consecutiveFailures = 0
-	} else if evictErrors > 0 {
-		p.consecutiveFailures++
-		p.lastFailureTime = time.Now()
-		logger.Warn("iCloud eviction cycle failed",
-			"errors", evictErrors,
-			"consecutive_failures", p.consecutiveFailures)
-	}
-
 	if result.BytesFreed > 0 {
 		logger.Info("iCloud eviction complete",
 			"files_evicted", result.ItemsCleaned,
@@ -850,14 +810,10 @@ func (p *ICloudPlugin) evictFiles(ctx context.Context, iCloudPath string, maxAge
 	return result
 }
 
-// evictFile evicts a single iCloud file with a per-file timeout.
-// brctl evict can hang under launchd daemon contexts, so we cap each call.
+// evictFile evicts a single iCloud file.
 func (p *ICloudPlugin) evictFile(ctx context.Context, path string) error {
-	evictCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(evictCtx, "brctl", "evict", path)
-	_, err := safeCombinedOutput(cmd)
-	return err
+	cmd := exec.CommandContext(ctx, "brctl", "evict", path)
+	return cmd.Run()
 }
 
 // =============================================================================

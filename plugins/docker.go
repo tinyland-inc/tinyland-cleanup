@@ -182,7 +182,7 @@ func (p *DockerPlugin) runDockerCommand(ctx context.Context, args ...string) (st
 	if p.socketPath != "" {
 		cmd.Env = append(os.Environ(), "DOCKER_HOST=unix://"+p.socketPath)
 	}
-	output, err := safeCombinedOutput(cmd)
+	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
 

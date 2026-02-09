@@ -5,7 +5,6 @@ import (
 	"context"
 	"log/slog"
 	"runtime"
-	"time"
 
 	"gitlab.com/tinyland/lab/tinyland-cleanup/config"
 )
@@ -77,71 +76,6 @@ type Plugin interface {
 	// level indicates the severity of cleanup needed
 	// ctx allows cancellation of long-running operations
 	Cleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult
-}
-
-// PluginV2 extends Plugin with resource group awareness and pre-flight checks.
-// Plugins can implement this interface for concurrent execution support.
-type PluginV2 interface {
-	Plugin
-
-	// ResourceGroup returns the concurrency control group for this plugin.
-	// Plugins in the same group run serially; different groups run in parallel.
-	ResourceGroup() string
-
-	// EstimatedDuration returns the expected runtime for scheduling hints.
-	EstimatedDuration() time.Duration
-
-	// PreflightCheck verifies prerequisites before cleanup runs.
-	PreflightCheck(ctx context.Context, cfg *config.Config) error
-}
-
-// BasePlugin provides default implementations for PluginV2 methods.
-// Embed this in plugin structs to get sensible defaults without implementing
-// all PluginV2 methods.
-type BasePlugin struct {
-	group    string
-	duration time.Duration
-}
-
-// NewBasePlugin creates a BasePlugin with the given resource group and estimated duration.
-func NewBasePlugin(group string, duration time.Duration) BasePlugin {
-	return BasePlugin{group: group, duration: duration}
-}
-
-// ResourceGroup returns the plugin's resource group.
-func (b BasePlugin) ResourceGroup() string {
-	if b.group == "" {
-		return "default"
-	}
-	return b.group
-}
-
-// EstimatedDuration returns the plugin's estimated duration.
-func (b BasePlugin) EstimatedDuration() time.Duration {
-	if b.duration == 0 {
-		return 30 * time.Second
-	}
-	return b.duration
-}
-
-// PreflightCheck is a no-op by default.
-func (b BasePlugin) PreflightCheck(ctx context.Context, cfg *config.Config) error {
-	return nil
-}
-
-// LegacyAdapter wraps an old Plugin interface to satisfy PluginV2.
-// This enables zero-change migration for existing plugins.
-type LegacyAdapter struct {
-	Plugin
-	BasePlugin
-}
-
-// NewLegacyAdapter wraps an existing Plugin with default PluginV2 behavior.
-func NewLegacyAdapter(p Plugin, group string) *LegacyAdapter {
-	return &LegacyAdapter{
-		Plugin:     p,
-		BasePlugin: NewBasePlugin(group, 30*time.Second),
-	}
 }
 
 // Registry holds registered cleanup plugins.
