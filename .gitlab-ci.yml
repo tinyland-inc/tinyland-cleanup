@@ -10,7 +10,7 @@ stages:
 variables:
   ATTIC_SERVER: "https://nix-cache.fuzzy-dev.tinyland.dev"
   ATTIC_CACHE: "tinyland-cleanup"
-  ATTIC_PUBLIC_KEY: "tinyland-lab:DYGxhyE9HSMLJDQYjWRSTDmgO2HHd6Sm+a5qaO2RwnQ="
+  ATTIC_PUBLIC_KEY: "tinyland-lab:wX4VELFLU2s+MwmbenLd6YPz79mbO1+XE4YzZl5WqBc="
 
 # Nix flake check (fast eval)
 check:flake:
@@ -38,7 +38,7 @@ check:flake:
     NIX_CONFIG: |
       experimental-features = nix-command flakes
       extra-substituters = ${ATTIC_SERVER}/${ATTIC_CACHE} ${ATTIC_SERVER}/main https://cache.nixos.org
-      extra-trusted-public-keys = ${ATTIC_PUBLIC_KEY} main:PBDvqG8OP3W2XF4QzuqWwZD/RhLRsE7ONxwM09kqTtw= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+      extra-trusted-public-keys = ${ATTIC_PUBLIC_KEY} main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
       connect-timeout = 5
       fallback = true
   before_script:
