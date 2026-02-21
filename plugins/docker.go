@@ -110,6 +110,8 @@ func (p *DockerPlugin) cleanModerate(ctx context.Context, cfg *config.Config, lo
 	logger.Debug("cleaning dangling images")
 	if output, err := p.runDockerCommand(ctx, "image", "prune", "-f"); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
+	} else {
+		logger.Warn("dangling image prune failed", "error", err, "output", output)
 	}
 
 	// Clean old images
@@ -117,18 +119,24 @@ func (p *DockerPlugin) cleanModerate(ctx context.Context, cfg *config.Config, lo
 	args := []string{"image", "prune", "-af", "--filter", fmt.Sprintf("until=%s", cfg.Docker.PruneImagesAge)}
 	if output, err := p.runDockerCommand(ctx, args...); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
+	} else {
+		logger.Warn("old image prune failed", "error", err, "output", output)
 	}
 
 	// Clean old stopped containers
 	logger.Debug("cleaning old containers")
 	if output, err := p.runDockerCommand(ctx, "container", "prune", "-f", "--filter", "until=1h"); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
+	} else {
+		logger.Warn("container prune failed", "error", err, "output", output)
 	}
 
 	// Clean old buildx cache
 	logger.Debug("cleaning buildx cache")
 	if output, err := p.runDockerCommand(ctx, "buildx", "prune", "-f", "--filter", "until=24h"); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
+	} else {
+		logger.Warn("buildx cache prune failed", "error", err, "output", output)
 	}
 
 	return result
@@ -138,22 +146,28 @@ func (p *DockerPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 	result := p.cleanModerate(ctx, cfg, logger)
 	result.Level = LevelAggressive
 
-	// Clean unused volumes
+	// Clean unused volumes (including named volumes)
 	logger.Debug("cleaning unused volumes")
-	if output, err := p.runDockerCommand(ctx, "volume", "prune", "-f"); err == nil {
+	if output, err := p.runDockerCommand(ctx, "volume", "prune", "-af"); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
+	} else {
+		logger.Warn("volume prune failed", "error", err, "output", output)
 	}
 
 	// Clean unused networks
 	logger.Debug("cleaning unused networks")
 	if output, err := p.runDockerCommand(ctx, "network", "prune", "-f"); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
+	} else {
+		logger.Warn("network prune failed", "error", err, "output", output)
 	}
 
 	// Clean all build cache
 	logger.Debug("cleaning all build cache")
 	if output, err := p.runDockerCommand(ctx, "builder", "prune", "-af"); err == nil {
 		result.BytesFreed += p.parseReclaimedSpace(output)
+	} else {
+		logger.Warn("builder cache prune failed", "error", err, "output", output)
 	}
 
 	return result
@@ -234,6 +248,7 @@ func (p *DockerPlugin) ProactiveCleanup(ctx context.Context, logger *slog.Logger
 	// Get Docker system df info
 	output, err := p.runDockerCommand(ctx, "system", "df", "--format", "{{.Reclaimable}}")
 	if err != nil {
+		logger.Warn("docker system df failed", "error", err, "output", output)
 		return result
 	}
 
@@ -246,23 +261,31 @@ func (p *DockerPlugin) ProactiveCleanup(ctx context.Context, logger *slog.Logger
 	logger.Info("proactive Docker cleanup", "reclaimable_gb", reclaimableGB)
 
 	// Clean dangling images
-	if _, err := p.runDockerCommand(ctx, "image", "prune", "-f"); err == nil {
+	if output, err := p.runDockerCommand(ctx, "image", "prune", "-f"); err == nil {
 		result.ItemsCleaned++
+	} else {
+		logger.Warn("proactive image prune failed", "error", err, "output", output)
 	}
 
 	// Clean old containers
-	if _, err := p.runDockerCommand(ctx, "container", "prune", "-f", "--filter", "until=1h"); err == nil {
+	if output, err := p.runDockerCommand(ctx, "container", "prune", "-f", "--filter", "until=1h"); err == nil {
 		result.ItemsCleaned++
+	} else {
+		logger.Warn("proactive container prune failed", "error", err, "output", output)
 	}
 
 	// Clean old build cache
-	if _, err := p.runDockerCommand(ctx, "builder", "prune", "-f", "--filter", "until=24h"); err == nil {
+	if output, err := p.runDockerCommand(ctx, "builder", "prune", "-f", "--filter", "until=24h"); err == nil {
 		result.ItemsCleaned++
+	} else {
+		logger.Warn("proactive builder prune failed", "error", err, "output", output)
 	}
 
-	// Clean dangling volumes
-	if _, err := p.runDockerCommand(ctx, "volume", "prune", "-f"); err == nil {
+	// Clean unused volumes (including named volumes)
+	if output, err := p.runDockerCommand(ctx, "volume", "prune", "-af"); err == nil {
 		result.ItemsCleaned++
+	} else {
+		logger.Warn("proactive volume prune failed", "error", err, "output", output)
 	}
 
 	return result
