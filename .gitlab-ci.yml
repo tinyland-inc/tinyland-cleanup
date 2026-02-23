@@ -11,10 +11,11 @@ variables:
   ATTIC_SERVER: "https://nix-cache.fuzzy-dev.tinyland.dev"
   ATTIC_CACHE: "tinyland-cleanup"
   ATTIC_PUBLIC_KEY: "tinyland-lab:wX4VELFLU2s+MwmbenLd6YPz79mbO1+XE4YzZl5WqBc="
+  CI_MIRROR: ${CI_MIRROR:-registry.gitlab.com/tinyland/gloriousflywheel}
 
 # Nix flake check (fast eval)
 check:flake:
-  image: nixos/nix:2.24.9
+  image: ${CI_MIRROR}/nix:2.24.9
   stage: check
   tags: [tinyland, docker]
   timeout: 5 minutes
@@ -31,7 +32,7 @@ check:flake:
 
 # Multi-arch builds
 .build_base:
-  image: nixos/nix:2.24.9
+  image: ${CI_MIRROR}/nix:2.24.9
   stage: build
   timeout: 20 minutes
   variables:
@@ -81,7 +82,7 @@ test:go:
 
 # Attic cache push
 cache:attic:
-  image: nixos/nix:2.24.9
+  image: ${CI_MIRROR}/nix:2.24.9
   stage: cache
   tags: [tinyland, docker]
   timeout: 10 minutes
