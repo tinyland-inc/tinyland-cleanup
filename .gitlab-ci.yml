@@ -61,6 +61,7 @@ build:x86_64-linux:
 
 build:aarch64-darwin:
   extends: .build_base
+  allow_failure: true  # PZM darwin-native runner frequently offline
   tags: [tinyland, darwin-native]
   script:
     - nix build .#packages.aarch64-darwin.default -o result-aarch64-darwin --print-build-logs
