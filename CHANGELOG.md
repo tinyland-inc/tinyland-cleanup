@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
 - Bazel/Bzlmod surface for the Go build and test graph.
 - GitHub CI and release workflow scaffolding.
 - Shared-cache Bazel wrapper for GloriousFlywheel runner attachment.
+- JSON cleanup cycle reports with dry-run plugin plans and host free-space
+  accounting.
 
 ### Changed
 

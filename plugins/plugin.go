@@ -49,8 +49,14 @@ type CleanupResult struct {
 	Plugin string
 	// Level at which cleanup was performed
 	Level CleanupLevel
-	// BytesFreed is the estimated bytes freed
+	// BytesFreed is the legacy aggregate byte count reported by the plugin.
 	BytesFreed int64
+	// EstimatedBytesFreed is based on local size estimates before deletion.
+	EstimatedBytesFreed int64
+	// CommandBytesFreed is reported by an external cleanup command.
+	CommandBytesFreed int64
+	// HostBytesFreed is measured from host free-space deltas when isolated.
+	HostBytesFreed int64
 	// ItemsCleaned is the number of items cleaned (files, images, etc.)
 	ItemsCleaned int
 	// Error if cleanup failed

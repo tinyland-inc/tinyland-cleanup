@@ -1,0 +1,156 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"testing"
+
+	"github.com/Jesssullivan/tinyland-cleanup/config"
+	"github.com/Jesssullivan/tinyland-cleanup/monitor"
+	"github.com/Jesssullivan/tinyland-cleanup/plugins"
+)
+
+func TestRunOnceDryRunJSONReport(t *testing.T) {
+	var output bytes.Buffer
+	mock := &reportingPlugin{}
+	daemon := newTestDaemon(t, mock, &output)
+	daemon.dryRun = true
+
+	if err := daemon.runOnce(context.Background(), monitor.LevelCritical); err != nil {
+		t.Fatalf("runOnce failed: %v", err)
+	}
+
+	if mock.called {
+		t.Fatal("dry-run should not call plugin cleanup")
+	}
+
+	report := decodeCycleReport(t, output.Bytes())
+	if !report.DryRun {
+		t.Fatal("expected dry_run report")
+	}
+	if report.Level != "critical" {
+		t.Fatalf("expected critical level, got %q", report.Level)
+	}
+	if report.HostFreeBeforeBytes == 0 || report.HostFreeAfterBytes == 0 {
+		t.Fatal("expected host free-space measurements")
+	}
+	if len(report.Plugins) != 1 {
+		t.Fatalf("expected 1 plugin report, got %d", len(report.Plugins))
+	}
+
+	plugin := report.Plugins[0]
+	if plugin.Name != "reporting" {
+		t.Fatalf("unexpected plugin name %q", plugin.Name)
+	}
+	if !plugin.WouldRun {
+		t.Fatal("expected dry-run plugin to be marked would_run")
+	}
+	if plugin.SkipReason != "dry_run" {
+		t.Fatalf("expected dry_run skip reason, got %q", plugin.SkipReason)
+	}
+}
+
+func TestRunOnceCleanupJSONReport(t *testing.T) {
+	var output bytes.Buffer
+	mock := &reportingPlugin{
+		result: plugins.CleanupResult{
+			Plugin:              "reporting",
+			Level:               plugins.LevelCritical,
+			BytesFreed:          1234,
+			EstimatedBytesFreed: 1000,
+			CommandBytesFreed:   200,
+			HostBytesFreed:      34,
+			ItemsCleaned:        2,
+		},
+	}
+	daemon := newTestDaemon(t, mock, &output)
+
+	if err := daemon.runOnce(context.Background(), monitor.LevelCritical); err != nil {
+		t.Fatalf("runOnce failed: %v", err)
+	}
+
+	if !mock.called {
+		t.Fatal("expected plugin cleanup to run")
+	}
+
+	report := decodeCycleReport(t, output.Bytes())
+	if report.DryRun {
+		t.Fatal("did not expect dry_run report")
+	}
+	if report.TotalBytesFreed != 1234 {
+		t.Fatalf("expected total bytes 1234, got %d", report.TotalBytesFreed)
+	}
+	if report.TotalItemsCleaned != 2 {
+		t.Fatalf("expected total items 2, got %d", report.TotalItemsCleaned)
+	}
+
+	plugin := report.Plugins[0]
+	if plugin.BytesFreed != 1234 {
+		t.Fatalf("expected plugin bytes 1234, got %d", plugin.BytesFreed)
+	}
+	if plugin.EstimatedBytesFreed != 1000 {
+		t.Fatalf("expected estimated bytes 1000, got %d", plugin.EstimatedBytesFreed)
+	}
+	if plugin.CommandBytesFreed != 200 {
+		t.Fatalf("expected command bytes 200, got %d", plugin.CommandBytesFreed)
+	}
+	if plugin.HostBytesFreed != 34 {
+		t.Fatalf("expected host bytes 34, got %d", plugin.HostBytesFreed)
+	}
+}
+
+func newTestDaemon(t *testing.T, plugin plugins.Plugin, output io.Writer) *daemon {
+	t.Helper()
+
+	cfg := config.DefaultConfig()
+	registry := plugins.NewRegistry()
+	registry.Register(plugin)
+
+	return &daemon{
+		config:   cfg,
+		registry: registry,
+		monitor:  monitor.NewDiskMonitor(80, 85, 90, 95),
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		output:   "json",
+		report:   output,
+	}
+}
+
+func decodeCycleReport(t *testing.T, data []byte) cycleReport {
+	t.Helper()
+
+	var report cycleReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("failed to decode JSON report: %v\n%s", err, string(data))
+	}
+	return report
+}
+
+type reportingPlugin struct {
+	called bool
+	result plugins.CleanupResult
+}
+
+func (p *reportingPlugin) Name() string {
+	return "reporting"
+}
+
+func (p *reportingPlugin) Description() string {
+	return "reports cleanup activity"
+}
+
+func (p *reportingPlugin) SupportedPlatforms() []string {
+	return nil
+}
+
+func (p *reportingPlugin) Enabled(*config.Config) bool {
+	return true
+}
+
+func (p *reportingPlugin) Cleanup(context.Context, plugins.CleanupLevel, *config.Config, *slog.Logger) plugins.CleanupResult {
+	p.called = true
+	return p.result
+}

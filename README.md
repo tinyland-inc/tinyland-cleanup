@@ -45,6 +45,17 @@ BAZEL_REMOTE_CACHE=grpc://bazel-cache.nix-cache.svc.cluster.local:9092 \
   scripts/bazel-cache-backed.sh test //...
 ```
 
+## Operator Review
+
+Review the cleanup plan before mutating a high-pressure machine:
+
+```sh
+tinyland-cleanup --once --dry-run --level critical --output json
+```
+
+See [docs/operator-workflow.md](docs/operator-workflow.md) for the current
+dry-run and host free-space accounting workflow.
+
 ## Distribution Status
 
 Current package authority is the Nix flake package `.#tinyland-cleanup`.

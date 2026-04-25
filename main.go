@@ -15,12 +15,14 @@
 //	-once             Run cleanup once and exit (default: false)
 //	-level string     Force cleanup level: none, warning, moderate, aggressive, critical
 //	-dry-run          Show what would be cleaned without actually cleaning
+//	-output string    Output format: text, json (default: text)
 //	-verbose          Enable verbose logging
 //	-version          Print version and exit
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -50,6 +52,7 @@ func main() {
 		once        = flag.Bool("once", false, "Run cleanup once and exit")
 		level       = flag.String("level", "", "Force cleanup level")
 		dryRun      = flag.Bool("dry-run", false, "Show what would be cleaned")
+		output      = flag.String("output", "text", "Output format: text, json")
 		verbose     = flag.Bool("verbose", false, "Enable verbose logging")
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
@@ -58,6 +61,11 @@ func main() {
 	if *showVersion {
 		fmt.Printf("tinyland-cleanup %s (%s) built %s\n", version, commit, date)
 		os.Exit(0)
+	}
+
+	if *output != "text" && *output != "json" {
+		fmt.Fprintf(os.Stderr, "invalid output format %q: expected text or json\n", *output)
+		os.Exit(2)
 	}
 
 	// Load configuration first to get log file path
@@ -118,6 +126,8 @@ func main() {
 		monitor:  diskMon,
 		logger:   logger,
 		dryRun:   *dryRun,
+		output:   *output,
+		report:   os.Stdout,
 	}
 
 	// Determine operation mode
@@ -173,6 +183,8 @@ type daemon struct {
 	monitor  *monitor.DiskMonitor
 	logger   *slog.Logger
 	dryRun   bool
+	output   string
+	report   io.Writer
 }
 
 func (d *daemon) run(ctx context.Context) error {
@@ -197,15 +209,32 @@ func (d *daemon) run(ctx context.Context) error {
 }
 
 func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) error {
-	// Determine which mount points to monitor
+	assessment := d.assessMounts()
 	level := forcedLevel
 
 	if level == monitor.LevelNone {
-		level = d.checkMounts()
+		level = assessment.Level
+	}
+
+	report := cycleReport{
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		DryRun:      d.dryRun,
+		ForcedLevel: forcedLevel != monitor.LevelNone,
+		Level:       level.String(),
+		MonitorPath: d.primaryMonitorPath(assessment),
+		Mounts:      assessment.Mounts,
+	}
+
+	beforeStats, beforeErr := monitor.GetDiskStats(report.MonitorPath)
+	if beforeErr != nil {
+		report.HostFreeError = beforeErr.Error()
+		d.logger.Warn("failed to measure host free space before cleanup", "path", report.MonitorPath, "error", beforeErr)
+	} else {
+		report.HostFreeBeforeBytes = beforeStats.Free
 	}
 
 	if level == monitor.LevelNone {
-		return nil
+		return d.writeReport(report)
 	}
 
 	// Convert monitor level to plugin level
@@ -216,18 +245,41 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 	d.logger.Debug("running plugins", "count", len(enabledPlugins))
 
 	var totalFreed int64
+	var totalItems int
 	for _, p := range enabledPlugins {
+		pluginReport := pluginCycleReport{
+			Name:        p.Name(),
+			Description: p.Description(),
+			Level:       level.String(),
+			DryRun:      d.dryRun,
+			WouldRun:    true,
+		}
+
 		if d.dryRun {
-			d.logger.Info("would run plugin", "plugin", p.Name(), "level", level.String())
+			pluginReport.SkipReason = "dry_run"
+			d.logger.Info("dry-run plugin plan",
+				"plugin", p.Name(),
+				"level", level.String(),
+				"description", p.Description(),
+			)
+			report.Plugins = append(report.Plugins, pluginReport)
 			continue
 		}
 
 		result := p.Cleanup(ctx, pluginLevel, d.config, d.logger)
+		pluginReport.BytesFreed = result.BytesFreed
+		pluginReport.EstimatedBytesFreed = result.EstimatedBytesFreed
+		pluginReport.CommandBytesFreed = result.CommandBytesFreed
+		pluginReport.HostBytesFreed = result.HostBytesFreed
+		pluginReport.ItemsCleaned = result.ItemsCleaned
 		if result.Error != nil {
+			pluginReport.Error = result.Error.Error()
+			report.Plugins = append(report.Plugins, pluginReport)
 			d.logger.Error("plugin failed", "plugin", p.Name(), "error", result.Error)
 			continue
 		}
 
+		report.Plugins = append(report.Plugins, pluginReport)
 		if result.BytesFreed > 0 || result.ItemsCleaned > 0 {
 			d.logger.Info("plugin completed",
 				"plugin", p.Name(),
@@ -235,8 +287,32 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 				"items_cleaned", result.ItemsCleaned,
 			)
 			totalFreed += result.BytesFreed
+			totalItems += result.ItemsCleaned
 		}
 	}
+
+	report.TotalBytesFreed = totalFreed
+	report.TotalItemsCleaned = totalItems
+
+	afterStats, afterErr := monitor.GetDiskStats(report.MonitorPath)
+	if afterErr != nil {
+		report.HostFreeError = afterErr.Error()
+		d.logger.Warn("failed to measure host free space after cleanup", "path", report.MonitorPath, "error", afterErr)
+	} else {
+		report.HostFreeAfterBytes = afterStats.Free
+		if beforeErr == nil {
+			report.HostFreeDeltaBytes = int64(afterStats.Free) - int64(beforeStats.Free)
+		}
+	}
+
+	d.logger.Info("cleanup cycle host free-space",
+		"path", report.MonitorPath,
+		"level", report.Level,
+		"dry_run", report.DryRun,
+		"before_free_gb", bytesToGB(report.HostFreeBeforeBytes),
+		"after_free_gb", bytesToGB(report.HostFreeAfterBytes),
+		"delta_mb", report.HostFreeDeltaBytes/(1024*1024),
+	)
 
 	if !d.dryRun && totalFreed > 0 {
 		d.logger.Info("cleanup complete",
@@ -244,21 +320,77 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 		)
 	}
 
-	return nil
+	return d.writeReport(report)
 }
 
-// checkMounts monitors all configured mount points and returns the highest
+type cycleReport struct {
+	Timestamp           string              `json:"timestamp"`
+	DryRun              bool                `json:"dry_run"`
+	ForcedLevel         bool                `json:"forced_level"`
+	Level               string              `json:"level"`
+	MonitorPath         string              `json:"monitor_path"`
+	HostFreeBeforeBytes uint64              `json:"host_free_before_bytes"`
+	HostFreeAfterBytes  uint64              `json:"host_free_after_bytes"`
+	HostFreeDeltaBytes  int64               `json:"host_free_delta_bytes"`
+	HostFreeError       string              `json:"host_free_error,omitempty"`
+	TotalBytesFreed     int64               `json:"total_bytes_freed"`
+	TotalItemsCleaned   int                 `json:"total_items_cleaned"`
+	Mounts              []mountReport       `json:"mounts"`
+	Plugins             []pluginCycleReport `json:"plugins"`
+}
+
+type mountReport struct {
+	Label       string  `json:"label"`
+	Path        string  `json:"path"`
+	UsedPercent float64 `json:"used_percent"`
+	FreeGB      float64 `json:"free_gb"`
+	FreeBytes   uint64  `json:"free_bytes"`
+	Level       string  `json:"level"`
+	Error       string  `json:"error,omitempty"`
+}
+
+type pluginCycleReport struct {
+	Name                string `json:"name"`
+	Description         string `json:"description"`
+	Level               string `json:"level"`
+	DryRun              bool   `json:"dry_run"`
+	WouldRun            bool   `json:"would_run"`
+	SkipReason          string `json:"skip_reason,omitempty"`
+	BytesFreed          int64  `json:"bytes_freed"`
+	EstimatedBytesFreed int64  `json:"estimated_bytes_freed"`
+	CommandBytesFreed   int64  `json:"command_bytes_freed"`
+	HostBytesFreed      int64  `json:"host_bytes_freed"`
+	ItemsCleaned        int    `json:"items_cleaned"`
+	Error               string `json:"error,omitempty"`
+}
+
+type mountAssessment struct {
+	Level  monitor.CleanupLevel
+	Mounts []mountReport
+}
+
+// assessMounts monitors all configured mount points and returns the highest
 // cleanup level detected across all of them. Falls back to home directory
 // monitoring if no mounts are configured.
-func (d *daemon) checkMounts() monitor.CleanupLevel {
-	highestLevel := monitor.LevelNone
+func (d *daemon) assessMounts() mountAssessment {
+	assessment := mountAssessment{Level: monitor.LevelNone}
 
 	if len(d.config.MonitoredMounts) > 0 {
 		// Multi-mount monitoring: check each configured mount point
 		for _, mount := range d.config.MonitoredMounts {
 			stats, err := monitor.GetDiskStats(mount.Path)
+			label := mount.Label
+			if label == "" {
+				label = mount.Path
+			}
 			if err != nil {
 				d.logger.Warn("failed to check mount", "path", mount.Path, "label", mount.Label, "error", err)
+				assessment.Mounts = append(assessment.Mounts, mountReport{
+					Label: label,
+					Path:  mount.Path,
+					Level: monitor.LevelNone.String(),
+					Error: err.Error(),
+				})
 				continue
 			}
 
@@ -279,10 +411,14 @@ func (d *daemon) checkMounts() monitor.CleanupLevel {
 			}
 
 			mountLevel := mountMonitor.CheckLevel(stats)
-			label := mount.Label
-			if label == "" {
-				label = mount.Path
-			}
+			assessment.Mounts = append(assessment.Mounts, mountReport{
+				Label:       label,
+				Path:        mount.Path,
+				UsedPercent: stats.UsedPercent,
+				FreeGB:      stats.FreeGB,
+				FreeBytes:   stats.Free,
+				Level:       mountLevel.String(),
+			})
 
 			d.logger.Info("disk status",
 				"mount", label,
@@ -292,8 +428,8 @@ func (d *daemon) checkMounts() monitor.CleanupLevel {
 				"level", mountLevel.String(),
 			)
 
-			if mountLevel > highestLevel {
-				highestLevel = mountLevel
+			if mountLevel > assessment.Level {
+				assessment.Level = mountLevel
 			}
 		}
 	} else {
@@ -308,8 +444,23 @@ func (d *daemon) checkMounts() monitor.CleanupLevel {
 		stats, detectedLevel, err := d.monitor.Check(monitorPath)
 		if err != nil {
 			d.logger.Error("failed to check disk", "error", err)
-			return monitor.LevelNone
+			assessment.Mounts = append(assessment.Mounts, mountReport{
+				Label: monitorPath,
+				Path:  monitorPath,
+				Level: monitor.LevelNone.String(),
+				Error: err.Error(),
+			})
+			return assessment
 		}
+
+		assessment.Mounts = append(assessment.Mounts, mountReport{
+			Label:       monitorPath,
+			Path:        monitorPath,
+			UsedPercent: stats.UsedPercent,
+			FreeGB:      stats.FreeGB,
+			FreeBytes:   stats.Free,
+			Level:       detectedLevel.String(),
+		})
 
 		d.logger.Info("disk status",
 			"used_percent", fmt.Sprintf("%.1f%%", stats.UsedPercent),
@@ -317,10 +468,44 @@ func (d *daemon) checkMounts() monitor.CleanupLevel {
 			"level", detectedLevel.String(),
 		)
 
-		highestLevel = detectedLevel
+		assessment.Level = detectedLevel
 	}
 
-	return highestLevel
+	return assessment
+}
+
+func (d *daemon) checkMounts() monitor.CleanupLevel {
+	return d.assessMounts().Level
+}
+
+func (d *daemon) primaryMonitorPath(assessment mountAssessment) string {
+	for _, mount := range assessment.Mounts {
+		if mount.Error == "" && mount.Path != "" && mount.Level == assessment.Level.String() {
+			return mount.Path
+		}
+	}
+	for _, mount := range assessment.Mounts {
+		if mount.Error == "" && mount.Path != "" {
+			return mount.Path
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	return "/"
+}
+
+func (d *daemon) writeReport(report cycleReport) error {
+	if d.output != "json" {
+		return nil
+	}
+	encoder := json.NewEncoder(d.report)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(report)
+}
+
+func bytesToGB(bytes uint64) string {
+	return fmt.Sprintf("%.1f", float64(bytes)/(1024*1024*1024))
 }
 
 func registerPlugins(registry *plugins.Registry) {
