@@ -2,9 +2,11 @@ package plugins
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,8 +14,18 @@ import (
 	"github.com/Jesssullivan/tinyland-cleanup/config"
 )
 
+const nixDefaultCommandTimeout = 20 * time.Minute
+
 // NixPlugin handles Nix garbage collection operations.
 type NixPlugin struct{}
+
+type nixGeneration struct {
+	Number    int
+	CreatedAt time.Time
+	Current   bool
+	Scope     string
+	Profile   string
+}
 
 // NewNixPlugin creates a new Nix cleanup plugin.
 func NewNixPlugin() *NixPlugin {
@@ -27,7 +39,7 @@ func (p *NixPlugin) Name() string {
 
 // Description returns the plugin description.
 func (p *NixPlugin) Description() string {
-	return "Runs Nix garbage collection to clean old generations and store paths"
+	return "Runs Nix garbage collection with generation and daemon-contention safeguards"
 }
 
 // SupportedPlatforms returns supported platforms (all).
@@ -40,6 +52,77 @@ func (p *NixPlugin) Enabled(cfg *config.Config) bool {
 	return cfg.Enable.NixGC
 }
 
+// PlanCleanup returns a non-mutating Nix cleanup preflight plan.
+func (p *NixPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupPlan {
+	plan := CleanupPlan{
+		Plugin:   p.Name(),
+		Level:    level.String(),
+		Summary:  "Nix cleanup preflight plan",
+		WouldRun: true,
+		Steps:    nixPlanSteps(level, cfg.Nix),
+		Metadata: map[string]string{
+			"cleanup_level":                             level.String(),
+			"min_user_generations":                      strconv.Itoa(cfg.Nix.MinUserGenerations),
+			"min_system_generations":                    strconv.Itoa(cfg.Nix.MinSystemGenerations),
+			"delete_generations_older_than":             cfg.Nix.DeleteGenerationsOlderThan,
+			"critical_delete_generations_older_than":    cfg.Nix.CriticalDeleteGenerationsOlderThan,
+			"allow_store_optimize":                      strconv.FormatBool(cfg.Nix.AllowStoreOptimize),
+			"skip_when_daemon_busy":                     strconv.FormatBool(cfg.Nix.SkipWhenDaemonBusy),
+			"daemon_busy_backoff":                       cfg.Nix.DaemonBusyBackoff,
+			"max_gc_duration":                           cfg.Nix.MaxGCDuration,
+			"generation_policy_delete_older_than_level": nixGenerationPolicyAge(level, cfg.Nix),
+		},
+	}
+
+	if !p.isNixAvailable() {
+		plan.WouldRun = false
+		plan.SkipReason = "nix_collect_garbage_not_available"
+		plan.Summary = "Nix garbage collection is not available"
+		return plan
+	}
+
+	if busy, err := p.activeNixProcesses(ctx); err != nil {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf("could not inspect active Nix processes: %v", err))
+		if cfg.Nix.SkipWhenDaemonBusy {
+			plan.WouldRun = false
+			plan.SkipReason = "nix_process_inspection_failed"
+			plan.Summary = "Nix cleanup is deferred because active process inspection failed"
+			return plan
+		}
+	} else if len(busy) > 0 {
+		plan.Metadata["active_nix_processes"] = strings.Join(busy, ", ")
+		if cfg.Nix.SkipWhenDaemonBusy {
+			plan.WouldRun = false
+			plan.SkipReason = "nix_daemon_busy"
+			plan.Summary = "Nix cleanup is deferred because active Nix work was detected"
+			return plan
+		}
+	}
+
+	if output, err := p.collectGarbageDryRun(ctx, cfg.Nix); err != nil {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf("nix-collect-garbage dry-run failed: %v", err))
+	} else {
+		estimated := p.parseDryRunFreedSpace(output)
+		paths := p.parseDryRunStorePaths(output)
+		plan.EstimatedBytesFreed = estimated
+		plan.Metadata["dry_run_store_paths"] = strconv.Itoa(paths)
+		if estimated == 0 {
+			plan.Warnings = append(plan.Warnings, "Nix dry-run reported no reclaimable store space; live roots may be retaining the store")
+		}
+	}
+
+	targets, warnings := p.planGenerationTargets(ctx, level, cfg.Nix, logger)
+	plan.Targets = append(plan.Targets, targets...)
+	plan.Warnings = append(plan.Warnings, warnings...)
+	plan.Metadata["generation_targets"] = strconv.Itoa(len(targets))
+
+	if level == LevelCritical && !cfg.Nix.AllowStoreOptimize {
+		plan.Warnings = append(plan.Warnings, "critical Nix store optimization is disabled by allow_store_optimize=false")
+	}
+
+	return plan
+}
+
 // Cleanup performs Nix garbage collection at the specified level.
 func (p *NixPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{
@@ -47,22 +130,46 @@ func (p *NixPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config
 		Level:  level,
 	}
 
-	// Check if nix-collect-garbage is available
 	if !p.isNixAvailable() {
 		logger.Debug("nix not available, skipping")
 		return result
 	}
 
+	if cfg.Nix.SkipWhenDaemonBusy {
+		busy, err := p.activeNixProcesses(ctx)
+		if err != nil {
+			logger.Warn("could not inspect active Nix processes", "error", err)
+			return result
+		} else if len(busy) > 0 {
+			logger.Warn("skipping Nix cleanup because active Nix work was detected",
+				"processes", strings.Join(busy, ", "),
+				"backoff", cfg.Nix.DaemonBusyBackoff)
+			return result
+		}
+	}
+
+	if level >= LevelModerate {
+		generationResult := p.deleteUserGenerationsByPolicy(ctx, level, cfg.Nix, logger)
+		result.ItemsCleaned += generationResult.ItemsCleaned
+		if generationResult.Error != nil {
+			result.Error = generationResult.Error
+			return result
+		}
+	}
+
 	switch level {
-	case LevelWarning, LevelModerate:
-		// Light/moderate: just nix-collect-garbage (no -d flag)
-		result = p.collectGarbage(ctx, false, logger)
-	case LevelAggressive:
-		// Aggressive: nix-collect-garbage -d (delete old generations)
-		result = p.collectGarbage(ctx, true, logger)
+	case LevelWarning, LevelModerate, LevelAggressive:
+		gcResult := p.collectGarbage(ctx, level, nil, cfg.Nix, logger)
+		result.BytesFreed += gcResult.BytesFreed
+		result.CommandBytesFreed += gcResult.CommandBytesFreed
+		result.ItemsCleaned += gcResult.ItemsCleaned
+		result.Error = gcResult.Error
 	case LevelCritical:
-		// Critical: full GC + store optimize
-		result = p.collectGarbageCritical(ctx, logger)
+		gcResult := p.collectGarbageCritical(ctx, cfg.Nix, logger)
+		result.BytesFreed += gcResult.BytesFreed
+		result.CommandBytesFreed += gcResult.CommandBytesFreed
+		result.ItemsCleaned += gcResult.ItemsCleaned
+		result.Error = gcResult.Error
 	}
 
 	return result
@@ -73,18 +180,22 @@ func (p *NixPlugin) isNixAvailable() bool {
 	return err == nil
 }
 
-func (p *NixPlugin) collectGarbage(ctx context.Context, deleteOldGenerations bool, logger *slog.Logger) CleanupResult {
-	result := CleanupResult{Plugin: p.Name()}
+func (p *NixPlugin) collectGarbageDryRun(ctx context.Context, cfg config.NixConfig) (string, error) {
+	timeout := nixCommandTimeout(cfg)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	args := []string{}
-	if deleteOldGenerations {
-		args = append(args, "-d")
-		logger.Debug("running nix-collect-garbage -d")
-	} else {
-		logger.Debug("running nix-collect-garbage")
-	}
+	cmd := exec.CommandContext(ctx, "nix-collect-garbage", "--dry-run")
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+func (p *NixPlugin) collectGarbage(ctx context.Context, level CleanupLevel, args []string, cfg config.NixConfig, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{Plugin: p.Name(), Level: level}
+
+	logger.Debug("running nix-collect-garbage", "args", strings.Join(args, " "))
+
+	ctx, cancel := context.WithTimeout(ctx, nixCommandTimeout(cfg))
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nix-collect-garbage", args...)
@@ -94,79 +205,421 @@ func (p *NixPlugin) collectGarbage(ctx context.Context, deleteOldGenerations boo
 		return result
 	}
 
-	result.BytesFreed = p.parseFreedSpace(string(output))
+	result.CommandBytesFreed = p.parseFreedSpace(string(output))
+	result.BytesFreed = result.CommandBytesFreed
 	result.ItemsCleaned = p.parseDeletedPaths(string(output))
 
 	return result
 }
 
-func (p *NixPlugin) collectGarbageCritical(ctx context.Context, logger *slog.Logger) CleanupResult {
+func (p *NixPlugin) collectGarbageCritical(ctx context.Context, cfg config.NixConfig, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name(), Level: LevelCritical}
 
-	// First, collect garbage with -d
-	logger.Warn("CRITICAL: running nix-collect-garbage -d")
-	gcResult := p.collectGarbage(ctx, true, logger)
+	logger.Warn("CRITICAL: running Nix garbage collection")
+	gcResult := p.collectGarbage(ctx, LevelCritical, nil, cfg, logger)
 	result.BytesFreed = gcResult.BytesFreed
+	result.CommandBytesFreed = gcResult.CommandBytesFreed
 	result.ItemsCleaned = gcResult.ItemsCleaned
 	if gcResult.Error != nil {
 		result.Error = gcResult.Error
 		return result
 	}
 
-	// Then optimize the store (deduplicate)
+	if !cfg.AllowStoreOptimize {
+		logger.Warn("skipping nix-store --optimize because allow_store_optimize=false")
+		return result
+	}
+
 	logger.Warn("CRITICAL: running nix-store --optimize")
-	optimizeCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
+	optimizeCtx, cancel := context.WithTimeout(ctx, nixCommandTimeout(cfg))
 	defer cancel()
 
 	cmd := exec.CommandContext(optimizeCtx, "nix-store", "--optimize")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		logger.Error("nix-store --optimize failed", "error", err, "output", string(output))
-		// Don't fail the whole operation for optimize failure
-	} else {
-		// Parse optimization results
-		optimizedBytes := p.parseOptimizedSpace(string(output))
-		result.BytesFreed += optimizedBytes
+		return result
 	}
+
+	optimizedBytes := p.parseOptimizedSpace(string(output))
+	result.BytesFreed += optimizedBytes
+	result.CommandBytesFreed += optimizedBytes
 
 	return result
 }
 
-func (p *NixPlugin) parseFreedSpace(output string) int64 {
-	// Parse output like:
-	// "deleting '/nix/store/...' ..."
-	// "1234 store paths deleted, 5678.90 MiB freed"
+func (p *NixPlugin) deleteUserGenerationsByPolicy(ctx context.Context, level CleanupLevel, cfg config.NixConfig, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{Plugin: p.Name(), Level: level}
 
-	patterns := []string{
-		`([\d.]+)\s*MiB freed`,
-		`([\d.]+)\s*GiB freed`,
-		`([\d.]+)\s*KiB freed`,
+	if _, err := exec.LookPath("nix-env"); err != nil {
+		logger.Debug("nix-env not available, skipping generation policy deletion")
+		return result
 	}
 
+	generations, err := p.listGenerations(ctx, "user", "", cfg)
+	if err != nil {
+		logger.Warn("could not list user Nix profile generations", "error", err)
+		return result
+	}
+
+	olderThan := parseNixPolicyDuration(nixGenerationPolicyAge(level, cfg), 0)
+	if olderThan <= 0 {
+		return result
+	}
+
+	targets := nixGenerationTargets(generations, time.Now(), cfg.MinUserGenerations, olderThan)
+	var generationNumbers []string
+	for _, target := range targets {
+		if target.Action == "delete_generation" {
+			generationNumbers = append(generationNumbers, target.Version)
+		}
+	}
+	if len(generationNumbers) == 0 {
+		return result
+	}
+
+	args := append([]string{"--delete-generations"}, generationNumbers...)
+	deleteCtx, cancel := context.WithTimeout(ctx, nixCommandTimeout(cfg))
+	defer cancel()
+
+	cmd := exec.CommandContext(deleteCtx, "nix-env", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		result.Error = fmt.Errorf("nix-env %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		return result
+	}
+
+	result.ItemsCleaned = len(generationNumbers)
+	logger.Info("deleted old user Nix profile generations", "generations", strings.Join(generationNumbers, ", "))
+	return result
+}
+
+func (p *NixPlugin) planGenerationTargets(ctx context.Context, level CleanupLevel, cfg config.NixConfig, logger *slog.Logger) ([]CleanupTarget, []string) {
+	_ = logger
+
+	if _, err := exec.LookPath("nix-env"); err != nil {
+		return nil, []string{"nix-env is not available; generation retention targets could not be inspected"}
+	}
+
+	olderThan := parseNixPolicyDuration(nixGenerationPolicyAge(level, cfg), 0)
+	if olderThan <= 0 {
+		return nil, nil
+	}
+
+	var targets []CleanupTarget
+	var warnings []string
+
+	userGenerations, err := p.listGenerations(ctx, "user", "", cfg)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("could not inspect user Nix generations: %v", err))
+	} else {
+		targets = append(targets, nixGenerationTargets(userGenerations, time.Now(), cfg.MinUserGenerations, olderThan)...)
+	}
+
+	systemProfile := "/nix/var/nix/profiles/system"
+	systemGenerations, err := p.listGenerations(ctx, "system", systemProfile, cfg)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("could not inspect system Nix generations: %v", err))
+	} else {
+		systemTargets := nixGenerationTargets(systemGenerations, time.Now(), cfg.MinSystemGenerations, olderThan)
+		for i := range systemTargets {
+			if systemTargets[i].Action == "delete_generation" {
+				systemTargets[i].Protected = true
+				systemTargets[i].Action = "review_privileged_generation"
+				systemTargets[i].Reason = "outside retention policy, but system generation deletion requires explicit privileged workflow"
+			}
+		}
+		targets = append(targets, systemTargets...)
+	}
+
+	return targets, warnings
+}
+
+func (p *NixPlugin) listGenerations(ctx context.Context, scope, profile string, cfg config.NixConfig) ([]nixGeneration, error) {
+	args := []string{}
+	if profile != "" {
+		args = append(args, "-p", profile)
+	}
+	args = append(args, "--list-generations")
+
+	listCtx, cancel := context.WithTimeout(ctx, nixCommandTimeout(cfg))
+	defer cancel()
+
+	cmd := exec.CommandContext(listCtx, "nix-env", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("nix-env %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+
+	return parseNixGenerations(string(output), scope, profile)
+}
+
+func (p *NixPlugin) activeNixProcesses(ctx context.Context) ([]string, error) {
+	psCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(psCtx, "ps", "-axo", "comm=,args=")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return nixBusyProcessReasons(string(output)), nil
+}
+
+func nixPlanSteps(level CleanupLevel, cfg config.NixConfig) []string {
+	steps := []string{
+		"Inspect active Nix, Home Manager, and rebuild processes before locking the store",
+		"Run nix-collect-garbage --dry-run to estimate reclaimable store paths",
+		"List user and system profile generations and apply minimum-retention policy",
+		"Preserve current profile generations and visible system generations by default",
+	}
+
+	switch level {
+	case LevelWarning:
+		steps = append(steps, "Run non-destructive preflight only in dry-run output; cleanup mode runs plain Nix GC without generation deletion")
+	case LevelModerate, LevelAggressive:
+		steps = append(steps,
+			fmt.Sprintf("Delete user generations older than %s only when at least %d user generations remain", cfg.DeleteGenerationsOlderThan, cfg.MinUserGenerations),
+			"Run plain Nix GC after selected user generation deletion",
+		)
+	case LevelCritical:
+		steps = append(steps,
+			fmt.Sprintf("Delete user generations older than %s only when at least %d user generations remain", cfg.CriticalDeleteGenerationsOlderThan, cfg.MinUserGenerations),
+			"Run plain Nix GC after selected user generation deletion",
+		)
+		if cfg.AllowStoreOptimize {
+			steps = append(steps, "Run nix-store --optimize because allow_store_optimize=true")
+		} else {
+			steps = append(steps, "Skip nix-store --optimize because allow_store_optimize=false")
+		}
+	}
+
+	steps = append(steps, "Use cleanup-cycle host free-space accounting for before/after disk deltas")
+	return steps
+}
+
+func nixGenerationPolicyAge(level CleanupLevel, cfg config.NixConfig) string {
+	switch level {
+	case LevelCritical:
+		return cfg.CriticalDeleteGenerationsOlderThan
+	case LevelModerate, LevelAggressive:
+		return cfg.DeleteGenerationsOlderThan
+	default:
+		return ""
+	}
+}
+
+func nixCommandTimeout(cfg config.NixConfig) time.Duration {
+	return parseNixPolicyDuration(cfg.MaxGCDuration, nixDefaultCommandTimeout)
+}
+
+func parseNixPolicyDuration(raw string, fallback time.Duration) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+
+	if duration, err := time.ParseDuration(raw); err == nil {
+		return duration
+	}
+
+	re := regexp.MustCompile(`^(\d+)\s*([dDwW])$`)
+	matches := re.FindStringSubmatch(raw)
+	if len(matches) != 3 {
+		return fallback
+	}
+
+	value, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return fallback
+	}
+
+	switch strings.ToLower(matches[2]) {
+	case "d":
+		return time.Duration(value) * 24 * time.Hour
+	case "w":
+		return time.Duration(value) * 7 * 24 * time.Hour
+	default:
+		return fallback
+	}
+}
+
+func parseNixGenerations(output, scope, profile string) ([]nixGeneration, error) {
+	var generations []nixGeneration
+	re := regexp.MustCompile(`^\s*(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})(?:\s+\(current\))?`)
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		matches := re.FindStringSubmatch(line)
+		if len(matches) < 4 {
+			continue
+		}
+
+		number, err := strconv.Atoi(matches[1])
+		if err != nil {
+			continue
+		}
+
+		createdAt, err := time.ParseInLocation("2006-01-02 15:04:05", matches[2]+" "+matches[3], time.Local)
+		if err != nil {
+			continue
+		}
+
+		generations = append(generations, nixGeneration{
+			Number:    number,
+			CreatedAt: createdAt,
+			Current:   strings.Contains(line, "(current)"),
+			Scope:     scope,
+			Profile:   profile,
+		})
+	}
+
+	return generations, nil
+}
+
+func nixGenerationTargets(generations []nixGeneration, now time.Time, minKeep int, olderThan time.Duration) []CleanupTarget {
+	if minKeep < 1 {
+		minKeep = 1
+	}
+
+	sorted := append([]nixGeneration(nil), generations...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].CreatedAt.Equal(sorted[j].CreatedAt) {
+			return sorted[i].Number > sorted[j].Number
+		}
+		return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
+	})
+
+	protectedByMinimum := map[int]bool{}
+	for idx, generation := range sorted {
+		if idx >= minKeep {
+			break
+		}
+		protectedByMinimum[generation.Number] = true
+	}
+
+	cutoff := now.Add(-olderThan)
+	targets := make([]CleanupTarget, 0, len(sorted))
+	for _, generation := range sorted {
+		protected := generation.Current || protectedByMinimum[generation.Number] || generation.CreatedAt.After(cutoff)
+		action := "keep_generation"
+		reason := "within generation retention policy"
+		switch {
+		case generation.Current:
+			reason = "current profile generation"
+		case protectedByMinimum[generation.Number]:
+			reason = fmt.Sprintf("within minimum retained %s generations", generation.Scope)
+		case generation.CreatedAt.After(cutoff):
+			reason = "younger than configured generation age"
+		default:
+			action = "delete_generation"
+			reason = "older than configured generation age and outside retained minimum"
+		}
+
+		nameScope := generation.Scope
+		if nameScope == "" {
+			nameScope = "profile"
+		}
+		targets = append(targets, CleanupTarget{
+			Type:      "nix_generation",
+			Name:      fmt.Sprintf("%s generation %d", nameScope, generation.Number),
+			Version:   strconv.Itoa(generation.Number),
+			Path:      generation.Profile,
+			Protected: protected,
+			Action:    action,
+			Reason:    reason,
+		})
+	}
+
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].Name < targets[j].Name
+	})
+	return targets
+}
+
+func nixBusyProcessReasons(output string) []string {
+	seen := map[string]bool{}
+	var reasons []string
+
+	add := func(reason string) {
+		if !seen[reason] {
+			seen[reason] = true
+			reasons = append(reasons, reason)
+		}
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		normalized := strings.ToLower(strings.Join(strings.Fields(line), " "))
+		if normalized == "" {
+			continue
+		}
+
+		switch {
+		case strings.Contains(normalized, "home-manager switch"):
+			add("home-manager switch")
+		case strings.Contains(normalized, "darwin-rebuild"):
+			add("darwin-rebuild")
+		case strings.Contains(normalized, "nixos-rebuild"):
+			add("nixos-rebuild")
+		case strings.Contains(normalized, "nix-collect-garbage"):
+			add("nix-collect-garbage")
+		case strings.Contains(normalized, "nix-store") && strings.ContainsAny(normalized, "-"):
+			add("nix-store")
+		case regexp.MustCompile(`\bnix\s+(build|develop|shell|flake|profile|store|copy|run|log)\b`).MatchString(normalized):
+			add("nix " + regexp.MustCompile(`\bnix\s+(build|develop|shell|flake|profile|store|copy|run|log)\b`).FindStringSubmatch(normalized)[1])
+		case strings.Contains(normalized, "nix-daemon") &&
+			(strings.Contains(normalized, "--stdio") ||
+				strings.Contains(normalized, "--serve") ||
+				strings.Contains(normalized, "realise") ||
+				strings.Contains(normalized, "realize") ||
+				strings.Contains(normalized, "substitute")):
+			add("nix-daemon worker")
+		}
+	}
+
+	sort.Strings(reasons)
+	return reasons
+}
+
+func (p *NixPlugin) parseDryRunFreedSpace(output string) int64 {
+	if value := parseNixByteQuantity(output, []string{
+		`would free\s+([\d.]+)\s*(B|KiB|MiB|GiB|TiB)`,
+		`([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s+would be freed`,
+	}); value > 0 {
+		return value
+	}
+	return p.parseFreedSpace(output)
+}
+
+func (p *NixPlugin) parseDryRunStorePaths(output string) int {
+	patterns := []string{
+		`would delete\s+(\d+)\s+store paths?`,
+		`(\d+)\s+store paths?\s+would be deleted`,
+	}
 	for _, pattern := range patterns {
 		re := regexp.MustCompile(pattern)
 		matches := re.FindStringSubmatch(output)
 		if len(matches) >= 2 {
-			value, err := strconv.ParseFloat(matches[1], 64)
-			if err != nil {
-				continue
-			}
-
-			if strings.Contains(pattern, "GiB") {
-				return int64(value * 1024 * 1024 * 1024)
-			} else if strings.Contains(pattern, "MiB") {
-				return int64(value * 1024 * 1024)
-			} else if strings.Contains(pattern, "KiB") {
-				return int64(value * 1024)
+			count, err := strconv.Atoi(matches[1])
+			if err == nil {
+				return count
 			}
 		}
 	}
+	return p.parseDeletedPaths(output)
+}
 
-	return 0
+func (p *NixPlugin) parseFreedSpace(output string) int64 {
+	return parseNixByteQuantity(output, []string{
+		`([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s+freed`,
+	})
 }
 
 func (p *NixPlugin) parseDeletedPaths(output string) int {
-	// Parse "1234 store paths deleted"
 	re := regexp.MustCompile(`(\d+)\s*store paths deleted`)
 	matches := re.FindStringSubmatch(output)
 	if len(matches) >= 2 {
@@ -179,31 +632,34 @@ func (p *NixPlugin) parseDeletedPaths(output string) int {
 }
 
 func (p *NixPlugin) parseOptimizedSpace(output string) int64 {
-	// Parse output like "linked 1234 files, saved 567.89 MiB"
-	patterns := []string{
-		`saved\s*([\d.]+)\s*MiB`,
-		`saved\s*([\d.]+)\s*GiB`,
-		`saved\s*([\d.]+)\s*KiB`,
-	}
+	return parseNixByteQuantity(output, []string{
+		`saved\s*([\d.]+)\s*(B|KiB|MiB|GiB|TiB)`,
+	})
+}
 
+func parseNixByteQuantity(output string, patterns []string) int64 {
 	for _, pattern := range patterns {
 		re := regexp.MustCompile(pattern)
 		matches := re.FindStringSubmatch(output)
-		if len(matches) >= 2 {
+		if len(matches) >= 3 {
 			value, err := strconv.ParseFloat(matches[1], 64)
 			if err != nil {
 				continue
 			}
 
-			if strings.Contains(pattern, "GiB") {
+			switch matches[2] {
+			case "TiB":
+				return int64(value * 1024 * 1024 * 1024 * 1024)
+			case "GiB":
 				return int64(value * 1024 * 1024 * 1024)
-			} else if strings.Contains(pattern, "MiB") {
+			case "MiB":
 				return int64(value * 1024 * 1024)
-			} else if strings.Contains(pattern, "KiB") {
+			case "KiB":
 				return int64(value * 1024)
+			case "B":
+				return int64(value)
 			}
 		}
 	}
-
 	return 0
 }

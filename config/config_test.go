@@ -233,6 +233,35 @@ func TestPodmanCompactDefaults(t *testing.T) {
 	}
 }
 
+func TestNixPolicyDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.Nix.MinUserGenerations != 5 {
+		t.Errorf("Nix.MinUserGenerations should be 5, got %d", cfg.Nix.MinUserGenerations)
+	}
+	if cfg.Nix.MinSystemGenerations != 3 {
+		t.Errorf("Nix.MinSystemGenerations should be 3, got %d", cfg.Nix.MinSystemGenerations)
+	}
+	if cfg.Nix.DeleteGenerationsOlderThan != "14d" {
+		t.Errorf("Nix.DeleteGenerationsOlderThan should be 14d, got %q", cfg.Nix.DeleteGenerationsOlderThan)
+	}
+	if cfg.Nix.CriticalDeleteGenerationsOlderThan != "3d" {
+		t.Errorf("Nix.CriticalDeleteGenerationsOlderThan should be 3d, got %q", cfg.Nix.CriticalDeleteGenerationsOlderThan)
+	}
+	if cfg.Nix.AllowStoreOptimize {
+		t.Error("Nix.AllowStoreOptimize should be false by default")
+	}
+	if !cfg.Nix.SkipWhenDaemonBusy {
+		t.Error("Nix.SkipWhenDaemonBusy should be true by default")
+	}
+	if cfg.Nix.DaemonBusyBackoff != "30m" {
+		t.Errorf("Nix.DaemonBusyBackoff should be 30m, got %q", cfg.Nix.DaemonBusyBackoff)
+	}
+	if cfg.Nix.MaxGCDuration != "20m" {
+		t.Errorf("Nix.MaxGCDuration should be 20m, got %q", cfg.Nix.MaxGCDuration)
+	}
+}
+
 func TestDarwinDevCacheDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 	if runtime.GOOS == "darwin" && !cfg.DarwinDevCaches.Enabled {
@@ -294,6 +323,15 @@ podman:
   compact_keep_backup_until_restart: false
   compact_provider_allowlist:
     - applehv
+nix:
+  min_user_generations: 7
+  min_system_generations: 4
+  delete_generations_older_than: 21d
+  critical_delete_generations_older_than: 5d
+  allow_store_optimize: true
+  skip_when_daemon_busy: false
+  daemon_busy_backoff: 45m
+  max_gc_duration: 10m
 darwin_dev_caches:
   enabled: true
   max_total_gb: 20
@@ -365,6 +403,30 @@ darwin_dev_caches:
 	}
 	if len(cfg.Podman.CompactProviderAllowlist) != 1 || cfg.Podman.CompactProviderAllowlist[0] != "applehv" {
 		t.Errorf("unexpected Podman.CompactProviderAllowlist: %#v", cfg.Podman.CompactProviderAllowlist)
+	}
+	if cfg.Nix.MinUserGenerations != 7 {
+		t.Errorf("Nix.MinUserGenerations should be 7 per config, got %d", cfg.Nix.MinUserGenerations)
+	}
+	if cfg.Nix.MinSystemGenerations != 4 {
+		t.Errorf("Nix.MinSystemGenerations should be 4 per config, got %d", cfg.Nix.MinSystemGenerations)
+	}
+	if cfg.Nix.DeleteGenerationsOlderThan != "21d" {
+		t.Errorf("Nix.DeleteGenerationsOlderThan should be 21d per config, got %q", cfg.Nix.DeleteGenerationsOlderThan)
+	}
+	if cfg.Nix.CriticalDeleteGenerationsOlderThan != "5d" {
+		t.Errorf("Nix.CriticalDeleteGenerationsOlderThan should be 5d per config, got %q", cfg.Nix.CriticalDeleteGenerationsOlderThan)
+	}
+	if !cfg.Nix.AllowStoreOptimize {
+		t.Error("Nix.AllowStoreOptimize should be true per config")
+	}
+	if cfg.Nix.SkipWhenDaemonBusy {
+		t.Error("Nix.SkipWhenDaemonBusy should be false per config")
+	}
+	if cfg.Nix.DaemonBusyBackoff != "45m" {
+		t.Errorf("Nix.DaemonBusyBackoff should be 45m per config, got %q", cfg.Nix.DaemonBusyBackoff)
+	}
+	if cfg.Nix.MaxGCDuration != "10m" {
+		t.Errorf("Nix.MaxGCDuration should be 10m per config, got %q", cfg.Nix.MaxGCDuration)
 	}
 	if !cfg.DarwinDevCaches.Enabled {
 		t.Error("DarwinDevCaches.Enabled should be true per config")

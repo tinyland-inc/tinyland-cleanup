@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
   allocation accounting and active-container safety gates.
 - Structured dry-run targets for Darwin developer caches such as JetBrains,
   Playwright, Bazelisk, and pip.
+- Nix cleanup preflight plans with dry-run reclaim estimates, generation
+  retention targets, daemon-contention detection, and opt-in store optimization.
 
 ### Changed
 

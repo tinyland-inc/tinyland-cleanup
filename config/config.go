@@ -35,6 +35,9 @@ type Config struct {
 	// Podman-specific settings
 	Podman PodmanConfig `yaml:"podman"`
 
+	// Nix-specific cleanup settings
+	Nix NixConfig `yaml:"nix"`
+
 	// iCloud-specific settings (Darwin)
 	ICloud ICloudConfig `yaml:"icloud"`
 
@@ -161,6 +164,26 @@ type PodmanConfig struct {
 	CompactKeepBackupUntilRestart bool `yaml:"compact_keep_backup_until_restart"`
 	// CompactProviderAllowlist restricts offline compaction to known providers
 	CompactProviderAllowlist []string `yaml:"compact_provider_allowlist"`
+}
+
+// NixConfig holds Nix store and profile generation cleanup settings.
+type NixConfig struct {
+	// MinUserGenerations preserves at least this many user profile generations.
+	MinUserGenerations int `yaml:"min_user_generations"`
+	// MinSystemGenerations preserves at least this many system/darwin generations when visible.
+	MinSystemGenerations int `yaml:"min_system_generations"`
+	// DeleteGenerationsOlderThan is the normal generation age policy.
+	DeleteGenerationsOlderThan string `yaml:"delete_generations_older_than"`
+	// CriticalDeleteGenerationsOlderThan is the critical-level generation age policy.
+	CriticalDeleteGenerationsOlderThan string `yaml:"critical_delete_generations_older_than"`
+	// AllowStoreOptimize enables nix-store --optimize at critical level.
+	AllowStoreOptimize bool `yaml:"allow_store_optimize"`
+	// SkipWhenDaemonBusy skips Nix cleanup when active Nix work is detected.
+	SkipWhenDaemonBusy bool `yaml:"skip_when_daemon_busy"`
+	// DaemonBusyBackoff is the operator-facing backoff after busy detection.
+	DaemonBusyBackoff string `yaml:"daemon_busy_backoff"`
+	// MaxGCDuration bounds nix-collect-garbage and related Nix commands.
+	MaxGCDuration string `yaml:"max_gc_duration"`
 }
 
 // ICloudConfig holds iCloud-specific cleanup settings (Darwin).
@@ -294,6 +317,16 @@ func DefaultConfig() *Config {
 			CompactRequireNoActiveContainers: true,
 			CompactKeepBackupUntilRestart:    true,
 			CompactProviderAllowlist:         []string{"applehv", "libkrun", "qemu"},
+		},
+		Nix: NixConfig{
+			MinUserGenerations:                 5,
+			MinSystemGenerations:               3,
+			DeleteGenerationsOlderThan:         "14d",
+			CriticalDeleteGenerationsOlderThan: "3d",
+			AllowStoreOptimize:                 false,
+			SkipWhenDaemonBusy:                 true,
+			DaemonBusyBackoff:                  "30m",
+			MaxGCDuration:                      "20m",
 		},
 		Lima: LimaConfig{
 			VMNames: []string{"colima", "unified"},

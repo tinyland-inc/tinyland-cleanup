@@ -1,0 +1,67 @@
+# Nix Cleanup Policy
+
+Nix cleanup is now planned before mutation. The plugin reports dry-run store
+reclaim estimates, visible profile generations, and active Nix work before it
+touches generations or the store.
+
+Review with:
+
+```sh
+tinyland-cleanup --once --dry-run --level critical --output json
+```
+
+The Nix plan includes:
+
+- `estimated_bytes_freed` from `nix-collect-garbage --dry-run`;
+- detected active Nix work such as `nix build`, `home-manager switch`,
+  `darwin-rebuild`, `nixos-rebuild`, and worker-style `nix-daemon` activity;
+- generation targets with `keep_generation`, `delete_generation`, or
+  `review_privileged_generation` actions;
+- configured minimum user and system generation retention;
+- whether critical `nix-store --optimize` is allowed.
+
+Default policy:
+
+```yaml
+nix:
+  min_user_generations: 5
+  min_system_generations: 3
+  delete_generations_older_than: 14d
+  critical_delete_generations_older_than: 3d
+  allow_store_optimize: false
+  skip_when_daemon_busy: true
+  daemon_busy_backoff: 30m
+  max_gc_duration: 20m
+```
+
+Runtime behavior:
+
+- warning runs plain Nix garbage collection only;
+- moderate and aggressive may delete old user profile generations selected by
+  the age policy, while preserving the current generation and the minimum count;
+- critical uses the stricter age policy, then runs plain Nix garbage collection;
+- system or nix-darwin generations are reported for operator review but are not
+  deleted by the unprivileged plugin path;
+- `nix-store --optimize` runs only when `allow_store_optimize: true`.
+
+Recommended Darwin developer-machine defaults are the repo defaults above.
+They preserve Home Manager rollback safety, avoid fighting active
+`home-manager switch` or `darwin-rebuild` work, and keep store optimization
+opt-in because it can be long-running.
+
+Recommended Rocky or Linux runner defaults:
+
+```yaml
+nix:
+  min_user_generations: 3
+  min_system_generations: 2
+  delete_generations_older_than: 7d
+  critical_delete_generations_older_than: 2d
+  allow_store_optimize: false
+  skip_when_daemon_busy: true
+  daemon_busy_backoff: 15m
+  max_gc_duration: 15m
+```
+
+Keep `skip_when_daemon_busy` enabled on build runners. A cleanup cycle that
+breaks an active Nix build or remote-cache proof is worse than a deferred GC.
