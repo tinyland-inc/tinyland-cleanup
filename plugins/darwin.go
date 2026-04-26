@@ -452,6 +452,7 @@ func (p *CachePlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *
 		},
 		Metadata: map[string]string{
 			"darwin_dev_caches_enabled": strconv.FormatBool(cfg.DarwinDevCaches.Enabled),
+			"darwin_dev_caches_enforce": strconv.FormatBool(cfg.DarwinDevCaches.Enforce),
 			"max_total_gb":              strconv.Itoa(cfg.DarwinDevCaches.MaxTotalGB),
 		},
 	}
@@ -464,7 +465,7 @@ func (p *CachePlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *
 
 	home, _ := os.UserHomeDir()
 	activeProcesses := darwinActiveProcessNames(ctx)
-	targets := p.darwinDeveloperCacheTargets(home, cfg.DarwinDevCaches, activeProcesses)
+	targets := p.darwinDeveloperCacheTargets(home, cfg.DarwinDevCaches, activeProcesses, level)
 	sort.Slice(targets, func(i, j int) bool {
 		if targets[i].Bytes == targets[j].Bytes {
 			return targets[i].Path < targets[j].Path
@@ -473,18 +474,27 @@ func (p *CachePlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *
 	})
 
 	var total int64
+	var estimated int64
 	for _, target := range targets {
 		total += target.Bytes
+		if target.Action == "delete" {
+			estimated += target.Bytes
+		}
 	}
 
 	plan.Targets = targets
+	plan.EstimatedBytesFreed = estimated
 	plan.Metadata["target_count"] = strconv.Itoa(len(targets))
 	plan.Metadata["total_physical_bytes"] = strconv.FormatInt(total, 10)
 
 	if cfg.DarwinDevCaches.MaxTotalGB > 0 && total > int64(cfg.DarwinDevCaches.MaxTotalGB)*1024*1024*1024 {
 		plan.Warnings = append(plan.Warnings, "known Darwin developer caches exceed configured review budget")
 	}
-	plan.Warnings = append(plan.Warnings, "this slice reports typed cache candidates only; budget enforcement remains opt-in follow-up work")
+	if !cfg.DarwinDevCaches.Enforce {
+		plan.Warnings = append(plan.Warnings, "Darwin developer-cache enforcement is disabled; targets are review-only until darwin_dev_caches.enforce is true")
+	} else if level < LevelModerate {
+		plan.Warnings = append(plan.Warnings, "Darwin developer-cache enforcement requires moderate or higher cleanup level")
+	}
 
 	return plan
 }
@@ -589,7 +599,7 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 	}
 
 	// macOS Library/Caches (only at critical)
-	if level >= LevelCritical {
+	if level >= LevelCritical && !cfg.DarwinDevCaches.Enabled {
 		libraryCaches := filepath.Join(home, "Library", "Caches")
 		if _, err := os.Stat(libraryCaches); err == nil {
 			sizeBefore := getDirSize(libraryCaches)
@@ -598,6 +608,16 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 			sizeAfter := getDirSize(libraryCaches)
 			result.BytesFreed += sizeBefore - sizeAfter
 			logger.Debug("cleaned macOS Library/Caches", "freed_mb", (sizeBefore-sizeAfter)/(1024*1024))
+		}
+	}
+
+	if cfg.DarwinDevCaches.Enabled && cfg.DarwinDevCaches.Enforce && level >= LevelModerate {
+		darwinResult := p.cleanupDarwinDeveloperCacheTargets(ctx, level, home, cfg.DarwinDevCaches, logger)
+		result.BytesFreed += darwinResult.BytesFreed
+		result.EstimatedBytesFreed += darwinResult.EstimatedBytesFreed
+		result.ItemsCleaned += darwinResult.ItemsCleaned
+		if darwinResult.Error != nil {
+			result.Error = darwinResult.Error
 		}
 	}
 
@@ -612,14 +632,17 @@ type darwinCacheEntry struct {
 	bytes   int64
 }
 
-func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.DarwinDevCachesConfig, activeProcesses map[string]bool) []CleanupTarget {
+func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.DarwinDevCachesConfig, activeProcesses map[string]bool, level CleanupLevel) []CleanupTarget {
 	var targets []CleanupTarget
+	enforce := cfg.Enforce && level >= LevelModerate
 
 	if cfg.JetBrains.Enabled {
 		jetBrainsRoot := filepath.Join(home, "Library", "Caches", "JetBrains")
 		jetBrainsActive := cfg.JetBrains.KeepActiveVersions && darwinAnyProcessActive(activeProcesses,
 			"appcode", "clion", "datagrip", "goland", "idea", "intellij", "phpstorm", "pycharm", "rider", "rubymine", "webstorm")
 		for _, entry := range listDarwinCacheEntries(jetBrainsRoot) {
+			stale := darwinCacheEntryStale(entry, cfg.JetBrains.StaleAfterDays)
+			eligible := !jetBrainsActive && (level >= LevelCritical || (level >= LevelAggressive && stale))
 			targets = append(targets, CleanupTarget{
 				Type:      "jetbrains",
 				Name:      entry.name,
@@ -627,9 +650,9 @@ func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.Darwin
 				Path:      entry.path,
 				Bytes:     entry.bytes,
 				Active:    jetBrainsActive,
-				Protected: jetBrainsActive,
-				Action:    darwinReviewAction(jetBrainsActive),
-				Reason:    darwinReviewReason(jetBrainsActive, "JetBrains cache version"),
+				Protected: darwinCacheProtected(jetBrainsActive, enforce, eligible),
+				Action:    darwinCacheAction(jetBrainsActive, enforce, eligible),
+				Reason:    darwinCacheReason(jetBrainsActive, enforce, eligible, "JetBrains cache version", "requires aggressive stale-cache enforcement or critical pressure"),
 			})
 		}
 	}
@@ -640,6 +663,7 @@ func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.Darwin
 		protected := newestPerFamily(entries, cfg.Playwright.KeepLatestPerFamily)
 		for _, entry := range entries {
 			isProtected := protected[entry.path]
+			eligible := !isProtected && level >= LevelModerate
 			targets = append(targets, CleanupTarget{
 				Type:      "playwright",
 				Name:      entry.name,
@@ -647,8 +671,8 @@ func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.Darwin
 				Path:      entry.path,
 				Bytes:     entry.bytes,
 				Protected: isProtected,
-				Action:    darwinReviewAction(isProtected),
-				Reason:    darwinReviewReason(isProtected, "Playwright browser revision"),
+				Action:    darwinCacheAction(isProtected, enforce, eligible),
+				Reason:    darwinCacheReason(isProtected, enforce, eligible, "Playwright browser revision", "older than keep-latest-per-family policy"),
 			})
 		}
 	}
@@ -662,6 +686,7 @@ func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.Darwin
 		keepLatest := cfg.Bazelisk.KeepLatest
 		for idx, entry := range entries {
 			isProtected := keepLatest > 0 && idx < keepLatest
+			eligible := !isProtected && level >= LevelModerate
 			targets = append(targets, CleanupTarget{
 				Type:      "bazelisk",
 				Name:      entry.name,
@@ -669,8 +694,8 @@ func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.Darwin
 				Path:      entry.path,
 				Bytes:     entry.bytes,
 				Protected: isProtected,
-				Action:    darwinReviewAction(isProtected),
-				Reason:    darwinReviewReason(isProtected, "Bazelisk download cache"),
+				Action:    darwinCacheAction(isProtected, enforce, eligible),
+				Reason:    darwinCacheReason(isProtected, enforce, eligible, "Bazelisk download cache", "older than keep-latest policy"),
 			})
 		}
 	}
@@ -683,18 +708,56 @@ func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.Darwin
 			if !pathExistsAndIsDir(pipPath) {
 				continue
 			}
+			stale := dirModTimeStale(pipPath, cfg.Pip.StaleAfterDays)
+			eligible := level >= LevelModerate && stale
 			targets = append(targets, CleanupTarget{
-				Type:   "pip",
-				Name:   filepath.Base(pipPath),
-				Path:   pipPath,
-				Bytes:  getDirAllocatedBytes(pipPath),
-				Action: "review",
-				Reason: fmt.Sprintf("pip cache; stale-after review budget is %d days", cfg.Pip.StaleAfterDays),
+				Type:      "pip",
+				Name:      filepath.Base(pipPath),
+				Path:      pipPath,
+				Bytes:     getDirAllocatedBytes(pipPath),
+				Protected: darwinCacheProtected(false, enforce, eligible),
+				Action:    darwinCacheAction(false, enforce, eligible),
+				Reason:    darwinCacheReason(false, enforce, eligible, "pip cache", fmt.Sprintf("stale-after policy is %d days", cfg.Pip.StaleAfterDays)),
 			})
 		}
 	}
 
 	return targets
+}
+
+func (p *CachePlugin) cleanupDarwinDeveloperCacheTargets(ctx context.Context, level CleanupLevel, home string, cfg config.DarwinDevCachesConfig, logger *slog.Logger) CleanupResult {
+	result := CleanupResult{
+		Plugin: p.Name(),
+		Level:  level,
+	}
+	targets := p.darwinDeveloperCacheTargets(home, cfg, darwinActiveProcessNames(ctx), level)
+	for _, target := range targets {
+		if target.Action != "delete" || target.Protected || target.Path == "" {
+			continue
+		}
+		sizeBefore := target.Bytes
+		if sizeBefore == 0 {
+			sizeBefore = getDirAllocatedBytes(target.Path)
+		}
+		result.EstimatedBytesFreed += sizeBefore
+		if err := os.RemoveAll(target.Path); err != nil {
+			result.Error = err
+			logger.Warn("failed to delete Darwin developer cache target", "path", target.Path, "type", target.Type, "error", err)
+			continue
+		}
+		sizeAfter := int64(0)
+		if pathExistsAndIsDir(target.Path) {
+			sizeAfter = getDirAllocatedBytes(target.Path)
+		}
+		freed := safeBytesDiff(sizeBefore, sizeAfter)
+		result.BytesFreed += freed
+		result.ItemsCleaned++
+		logger.Info("deleted Darwin developer cache target",
+			"type", target.Type,
+			"path", target.Path,
+			"freed_mb", freed/(1024*1024))
+	}
+	return result
 }
 
 func listDarwinCacheEntries(root string) []darwinCacheEntry {
@@ -759,18 +822,49 @@ func darwinCacheFamily(name string) string {
 	return name
 }
 
-func darwinReviewAction(protected bool) string {
-	if protected {
+func darwinCacheProtected(protected bool, enforce bool, eligible bool) bool {
+	return protected || (enforce && !eligible)
+}
+
+func darwinCacheAction(protected bool, enforce bool, eligible bool) string {
+	if protected || (enforce && !eligible) {
 		return "protect"
+	}
+	if enforce && eligible {
+		return "delete"
 	}
 	return "review"
 }
 
-func darwinReviewReason(protected bool, label string) string {
+func darwinCacheReason(protected bool, enforce bool, eligible bool, label string, eligibility string) string {
 	if protected {
 		return label + " is protected by active-use or keep-latest policy"
 	}
-	return label + " is a cleanup candidate for a future budget-enforcement pass"
+	if enforce && eligible {
+		return label + " is eligible for opt-in deletion: " + eligibility
+	}
+	if enforce {
+		return label + " is preserved by opt-in enforcement policy: " + eligibility
+	}
+	return label + " is a cleanup candidate for opt-in budget enforcement"
+}
+
+func darwinCacheEntryStale(entry darwinCacheEntry, staleAfterDays int) bool {
+	if staleAfterDays <= 0 {
+		return true
+	}
+	return entry.modTime.Before(time.Now().Add(-time.Duration(staleAfterDays) * 24 * time.Hour))
+}
+
+func dirModTimeStale(path string, staleAfterDays int) bool {
+	if staleAfterDays <= 0 {
+		return true
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.ModTime().Before(time.Now().Add(-time.Duration(staleAfterDays) * 24 * time.Hour))
 }
 
 func darwinActiveProcessNames(ctx context.Context) map[string]bool {

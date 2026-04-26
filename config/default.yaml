@@ -103,6 +103,27 @@ bazel:
   allow_stop_idle_servers: true
   allow_delete_active_output_bases: false
 
+# Darwin developer-cache review settings.
+# Enforcement is opt-in; keep false until dry-run targets are reviewed.
+darwin_dev_caches:
+  enabled: true
+  enforce: false
+  max_total_gb: 15
+  jetbrains:
+    enabled: true
+    max_gb: 8
+    stale_after_days: 14
+    keep_active_versions: true
+  playwright:
+    enabled: true
+    keep_latest_per_family: true
+  bazelisk:
+    enabled: true
+    keep_latest: 2
+  pip:
+    enabled: true
+    stale_after_days: 14
+
 # Lima VM settings (macOS)
 lima:
   vm_names:

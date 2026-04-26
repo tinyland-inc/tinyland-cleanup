@@ -311,6 +311,9 @@ func TestDarwinDevCacheDefaults(t *testing.T) {
 	if runtime.GOOS != "darwin" && cfg.DarwinDevCaches.Enabled {
 		t.Error("DarwinDevCaches.Enabled should default to false outside Darwin")
 	}
+	if cfg.DarwinDevCaches.Enforce {
+		t.Error("DarwinDevCaches.Enforce should default to false")
+	}
 	if cfg.DarwinDevCaches.MaxTotalGB != 15 {
 		t.Errorf("DarwinDevCaches.MaxTotalGB should default to 15, got %d", cfg.DarwinDevCaches.MaxTotalGB)
 	}
@@ -388,6 +391,7 @@ bazel:
   allow_delete_active_output_bases: true
 darwin_dev_caches:
   enabled: true
+  enforce: true
   max_total_gb: 20
   jetbrains:
     enabled: true
@@ -514,6 +518,9 @@ darwin_dev_caches:
 	}
 	if !cfg.DarwinDevCaches.Enabled {
 		t.Error("DarwinDevCaches.Enabled should be true per config")
+	}
+	if !cfg.DarwinDevCaches.Enforce {
+		t.Error("DarwinDevCaches.Enforce should be true per config")
 	}
 	if cfg.DarwinDevCaches.MaxTotalGB != 20 {
 		t.Errorf("DarwinDevCaches.MaxTotalGB should be 20 per config, got %d", cfg.DarwinDevCaches.MaxTotalGB)

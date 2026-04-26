@@ -258,6 +258,9 @@ type DevArtifactsConfig struct {
 type DarwinDevCachesConfig struct {
 	// Enabled controls typed Darwin developer-cache planning.
 	Enabled bool `yaml:"enabled"`
+	// Enforce enables real deletion of eligible Darwin developer-cache targets.
+	// Defaults false so the typed target surface remains review-only unless operators opt in.
+	Enforce bool `yaml:"enforce"`
 	// MaxTotalGB is the review budget across known Darwin developer caches.
 	MaxTotalGB int `yaml:"max_total_gb"`
 	// JetBrains controls JetBrains cache planning.
@@ -410,6 +413,7 @@ func DefaultConfig() *Config {
 		},
 		DarwinDevCaches: DarwinDevCachesConfig{
 			Enabled:    runtime.GOOS == "darwin",
+			Enforce:    false,
 			MaxTotalGB: 15,
 			JetBrains: DarwinDevCacheToolConfig{
 				Enabled:            true,
