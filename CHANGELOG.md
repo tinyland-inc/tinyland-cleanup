@@ -45,6 +45,7 @@ All notable changes to this project will be documented in this file.
 - Bazel cache-tier budget enforcement for stale repository cache, disk cache,
   and Bazelisk download targets when total Bazel footprint exceeds the
   configured budget.
+- Repo-local Bazel symlink cleanup after successful stale output-base deletion.
 - Active-process protection for development artifact cleanup families such as
   Node.js, Python, Rust, Go, Haskell, and LM Studio.
 - Typed Darwin developer-cache targets for VS Code and Cursor cache-only

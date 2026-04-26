@@ -280,6 +280,9 @@ func TestBazelPolicyDefaults(t *testing.T) {
 	if len(cfg.Bazel.Roots) == 0 {
 		t.Fatal("Bazel.Roots should have defaults")
 	}
+	if len(cfg.Bazel.WorkspaceRoots) != 3 {
+		t.Fatalf("Bazel.WorkspaceRoots should have 3 defaults, got %#v", cfg.Bazel.WorkspaceRoots)
+	}
 	if cfg.Bazel.BazeliskCache == "" {
 		t.Fatal("Bazel.BazeliskCache should have a default")
 	}
@@ -402,6 +405,8 @@ nix:
 bazel:
   roots:
     - ~/custom-bazel
+  workspace_roots:
+    - ~/custom-workspaces
   bazelisk_cache: ~/custom-bazelisk
   max_total_gb: 30
   keep_recent_output_bases: 2
@@ -523,6 +528,9 @@ darwin_dev_caches:
 	}
 	if len(cfg.Bazel.Roots) != 1 || cfg.Bazel.Roots[0] != "~/custom-bazel" {
 		t.Errorf("unexpected Bazel.Roots: %#v", cfg.Bazel.Roots)
+	}
+	if len(cfg.Bazel.WorkspaceRoots) != 1 || cfg.Bazel.WorkspaceRoots[0] != "~/custom-workspaces" {
+		t.Errorf("unexpected Bazel.WorkspaceRoots: %#v", cfg.Bazel.WorkspaceRoots)
 	}
 	if cfg.Bazel.BazeliskCache != "~/custom-bazelisk" {
 		t.Errorf("Bazel.BazeliskCache should be custom path, got %q", cfg.Bazel.BazeliskCache)

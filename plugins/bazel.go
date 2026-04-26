@@ -80,10 +80,12 @@ func (p *BazelPlugin) buildCleanupPlan(ctx context.Context, level CleanupLevel, 
 			"Measure logical and physical bytes without following repo-local bazel-* symlinks",
 			"Protect active output bases, protected workspace output bases, and newest output bases",
 			"Delete only stale inactive output bases and budget-excess cache tiers in real cleanup mode at moderate or higher levels",
+			"Remove repo-local bazel-* symlinks only after their target output base was deleted",
 		},
 		Metadata: map[string]string{
 			"cleanup_level":                    level.String(),
 			"max_total_gb":                     strconv.Itoa(cfg.Bazel.MaxTotalGB),
+			"workspace_root_count":             strconv.Itoa(len(cfg.Bazel.WorkspaceRoots)),
 			"keep_recent_output_bases":         strconv.Itoa(cfg.Bazel.KeepRecentOutputBases),
 			"stale_after":                      cfg.Bazel.StaleAfter,
 			"critical_stale_after":             cfg.Bazel.CriticalStaleAfter,
@@ -131,7 +133,8 @@ func (p *BazelPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 		return result
 	}
 
-	result = applyBazelCleanupTargets(ctx, p.Name(), level, plan.Targets, logger)
+	home, _ := os.UserHomeDir()
+	result = applyBazelCleanupTargets(ctx, p.Name(), level, plan.Targets, cfg.Bazel.WorkspaceRoots, home, logger)
 	if result.ItemsCleaned == 0 {
 		logger.Info("Bazel cleanup found no eligible stale inactive output bases", "level", level.String())
 	}
@@ -534,7 +537,7 @@ func bazelEstimatedCandidateBytes(targets []CleanupTarget) int64 {
 	return total
 }
 
-func applyBazelCleanupTargets(ctx context.Context, plugin string, level CleanupLevel, targets []CleanupTarget, logger *slog.Logger) CleanupResult {
+func applyBazelCleanupTargets(ctx context.Context, plugin string, level CleanupLevel, targets []CleanupTarget, workspaceRoots []string, home string, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: plugin, Level: level}
 	for _, target := range targets {
 		if !bazelTargetEligibleForDeletion(target) {
@@ -547,6 +550,12 @@ func applyBazelCleanupTargets(ctx context.Context, plugin string, level CleanupL
 		if err := deleteBazelTarget(target, logger); err != nil {
 			logger.Warn("failed to delete Bazel target", "type", target.Type, "path", target.Path, "error", err)
 			continue
+		}
+		if target.Type == "output_base" {
+			removedLinks := cleanupRepoLocalBazelSymlinksForDeletedOutputBase(workspaceRoots, home, target.Path, logger)
+			if removedLinks > 0 {
+				logger.Info("removed repo-local Bazel symlinks for deleted output base", "output_base", target.Path, "links_removed", removedLinks)
+			}
 		}
 		result.BytesFreed += target.Bytes
 		result.EstimatedBytesFreed += target.Bytes
@@ -589,6 +598,84 @@ func deleteBazelOutputBase(path string, logger *slog.Logger) error {
 		return err
 	}
 	return os.RemoveAll(path)
+}
+
+func cleanupRepoLocalBazelSymlinksForDeletedOutputBase(workspaceRoots []string, home string, outputBase string, logger *slog.Logger) int {
+	if len(workspaceRoots) == 0 || outputBase == "" {
+		return 0
+	}
+
+	outputBase = filepath.Clean(outputBase)
+	removed := 0
+	for _, root := range workspaceRoots {
+		expanded := expandHome(root, home)
+		_ = filepath.WalkDir(expanded, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if !entry.IsDir() {
+				return nil
+			}
+			if path != expanded && bazelWorkspaceScanDepth(expanded, path) > 2 {
+				return filepath.SkipDir
+			}
+			for _, linkName := range repoLocalBazelSymlinkNames(path) {
+				linkPath := filepath.Join(path, linkName)
+				if !bazelSymlinkTargetInsideOutputBase(linkPath, outputBase) {
+					continue
+				}
+				if err := os.Remove(linkPath); err != nil {
+					logger.Warn("failed to remove repo-local Bazel symlink", "path", linkPath, "output_base", outputBase, "error", err)
+					continue
+				}
+				removed++
+				logger.Debug("removed repo-local Bazel symlink", "path", linkPath, "output_base", outputBase)
+			}
+			return nil
+		})
+	}
+	return removed
+}
+
+func bazelWorkspaceScanDepth(root string, path string) int {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." {
+		return 0
+	}
+	return len(strings.Split(rel, string(os.PathSeparator)))
+}
+
+func repoLocalBazelSymlinkNames(workspace string) []string {
+	return []string{
+		"bazel-bin",
+		"bazel-out",
+		"bazel-testlogs",
+		"bazel-" + filepath.Base(workspace),
+	}
+}
+
+func bazelSymlinkTargetInsideOutputBase(linkPath string, outputBase string) bool {
+	info, err := os.Lstat(linkPath)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	rawTarget, err := os.Readlink(linkPath)
+	if err != nil || rawTarget == "" {
+		return false
+	}
+	target := rawTarget
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(linkPath), target)
+	}
+	return pathInsideRoot(filepath.Clean(target), outputBase)
+}
+
+func pathInsideRoot(path string, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 func deleteBazelCacheTier(targetType, path string, logger *slog.Logger) error {

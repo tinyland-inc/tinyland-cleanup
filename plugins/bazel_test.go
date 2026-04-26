@@ -268,6 +268,12 @@ func TestApplyBazelCleanupTargetsDeletesEligibleOutputBase(t *testing.T) {
 	if err := os.Chmod(filepath.Dir(generated), 0500); err != nil {
 		t.Fatal(err)
 	}
+	workspaceRoot := filepath.Join(root, "workspaces")
+	workspace := filepath.Join(workspaceRoot, "project")
+	mustMkdir(t, workspace)
+	if err := os.Symlink(filepath.Dir(generated), filepath.Join(workspace, "bazel-bin")); err != nil {
+		t.Fatal(err)
+	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	result := applyBazelCleanupTargets(context.Background(), "bazel", LevelModerate, []CleanupTarget{
@@ -278,7 +284,7 @@ func TestApplyBazelCleanupTargetsDeletesEligibleOutputBase(t *testing.T) {
 			Bytes:  123,
 			Action: "delete_output_base",
 		},
-	}, logger)
+	}, []string{workspaceRoot}, root, logger)
 
 	if result.Error != nil {
 		t.Fatalf("unexpected error: %v", result.Error)
@@ -291,6 +297,42 @@ func TestApplyBazelCleanupTargetsDeletesEligibleOutputBase(t *testing.T) {
 	}
 	if _, err := os.Stat(outputBase); !os.IsNotExist(err) {
 		t.Fatalf("expected output base to be deleted, stat err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(workspace, "bazel-bin")); !os.IsNotExist(err) {
+		t.Fatalf("expected repo-local bazel-bin symlink to be removed, stat err=%v", err)
+	}
+}
+
+func TestCleanupRepoLocalBazelSymlinksOnlyRemovesLinksIntoDeletedOutputBase(t *testing.T) {
+	root := t.TempDir()
+	deletedOutputBase := filepath.Join(root, "_bazel_jess", "deleted")
+	keptOutputBase := filepath.Join(root, "_bazel_jess", "kept")
+	makeBazelOutputBase(t, deletedOutputBase)
+	makeBazelOutputBase(t, keptOutputBase)
+
+	workspaceRoot := filepath.Join(root, "workspaces")
+	deletedWorkspace := filepath.Join(workspaceRoot, "deleted-workspace")
+	keptWorkspace := filepath.Join(workspaceRoot, "kept-workspace")
+	mustMkdir(t, deletedWorkspace)
+	mustMkdir(t, keptWorkspace)
+	deletedTarget := filepath.Join(deletedOutputBase, "execroot", "_main", "bazel-out")
+	keptTarget := filepath.Join(keptOutputBase, "execroot", "_main", "bazel-out")
+	if err := os.Symlink(deletedTarget, filepath.Join(deletedWorkspace, "bazel-out")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(keptTarget, filepath.Join(keptWorkspace, "bazel-out")); err != nil {
+		t.Fatal(err)
+	}
+
+	removed := cleanupRepoLocalBazelSymlinksForDeletedOutputBase([]string{workspaceRoot}, root, deletedOutputBase, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if removed != 1 {
+		t.Fatalf("removed links = %d, want 1", removed)
+	}
+	if _, err := os.Lstat(filepath.Join(deletedWorkspace, "bazel-out")); !os.IsNotExist(err) {
+		t.Fatalf("expected deleted output-base symlink to be removed, stat err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(keptWorkspace, "bazel-out")); err != nil {
+		t.Fatalf("expected unrelated Bazel symlink to remain, stat err=%v", err)
 	}
 }
 
@@ -333,7 +375,7 @@ func TestApplyBazelCleanupTargetsDeletesEligibleCacheTier(t *testing.T) {
 			Bytes:  17,
 			Action: "delete_cache_tier",
 		},
-	}, logger)
+	}, nil, root, logger)
 
 	if result.Error != nil {
 		t.Fatalf("unexpected error: %v", result.Error)
@@ -365,7 +407,7 @@ func TestApplyBazelCleanupTargetsRejectsUnsafeCacheTierPath(t *testing.T) {
 			Bytes:  10,
 			Action: "delete_cache_tier",
 		},
-	}, logger)
+	}, nil, root, logger)
 
 	if result.ItemsCleaned != 0 {
 		t.Fatalf("items cleaned = %d, want 0", result.ItemsCleaned)
@@ -400,7 +442,7 @@ func TestApplyBazelCleanupTargetsSkipsProtectedAndActiveTargets(t *testing.T) {
 			Protected: true,
 			Action:    "delete_output_base",
 		},
-	}, logger)
+	}, nil, root, logger)
 
 	if result.ItemsCleaned != 0 {
 		t.Fatalf("items cleaned = %d, want 0", result.ItemsCleaned)
