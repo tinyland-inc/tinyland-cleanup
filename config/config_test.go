@@ -202,6 +202,9 @@ func TestEnableFlagsNewPlugins(t *testing.T) {
 	if !cfg.Enable.DevArtifacts {
 		t.Error("Enable.DevArtifacts should be true by default")
 	}
+	if !cfg.Enable.Bazel {
+		t.Error("Enable.Bazel should be true by default")
+	}
 	if runtime.GOOS == "darwin" && !cfg.Enable.APFSSnapshots {
 		t.Error("Enable.APFSSnapshots should be true on Darwin")
 	}
@@ -262,6 +265,38 @@ func TestNixPolicyDefaults(t *testing.T) {
 	}
 }
 
+func TestBazelPolicyDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if len(cfg.Bazel.Roots) == 0 {
+		t.Fatal("Bazel.Roots should have defaults")
+	}
+	if cfg.Bazel.BazeliskCache == "" {
+		t.Fatal("Bazel.BazeliskCache should have a default")
+	}
+	if cfg.Bazel.MaxTotalGB != 20 {
+		t.Errorf("Bazel.MaxTotalGB should be 20, got %d", cfg.Bazel.MaxTotalGB)
+	}
+	if cfg.Bazel.KeepRecentOutputBases != 5 {
+		t.Errorf("Bazel.KeepRecentOutputBases should be 5, got %d", cfg.Bazel.KeepRecentOutputBases)
+	}
+	if cfg.Bazel.StaleAfter != "14d" {
+		t.Errorf("Bazel.StaleAfter should be 14d, got %q", cfg.Bazel.StaleAfter)
+	}
+	if cfg.Bazel.CriticalStaleAfter != "3d" {
+		t.Errorf("Bazel.CriticalStaleAfter should be 3d, got %q", cfg.Bazel.CriticalStaleAfter)
+	}
+	if len(cfg.Bazel.ProtectWorkspaces) == 0 {
+		t.Fatal("Bazel.ProtectWorkspaces should have defaults")
+	}
+	if !cfg.Bazel.AllowStopIdleServers {
+		t.Error("Bazel.AllowStopIdleServers should be true by default")
+	}
+	if cfg.Bazel.AllowDeleteActiveOutputBases {
+		t.Error("Bazel.AllowDeleteActiveOutputBases should be false by default")
+	}
+}
+
 func TestDarwinDevCacheDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 	if runtime.GOOS == "darwin" && !cfg.DarwinDevCaches.Enabled {
@@ -296,6 +331,7 @@ func TestLoadConfigWithNewFields(t *testing.T) {
 	content := `
 enable:
   dev_artifacts: true
+  bazel: true
   apfs_snapshots: true
 dev_artifacts:
   scan_paths:
@@ -332,6 +368,18 @@ nix:
   skip_when_daemon_busy: false
   daemon_busy_backoff: 45m
   max_gc_duration: 10m
+bazel:
+  roots:
+    - ~/custom-bazel
+  bazelisk_cache: ~/custom-bazelisk
+  max_total_gb: 30
+  keep_recent_output_bases: 2
+  stale_after: 10d
+  critical_stale_after: 2d
+  protect_workspaces:
+    - ~/git/important
+  allow_stop_idle_servers: false
+  allow_delete_active_output_bases: true
 darwin_dev_caches:
   enabled: true
   max_total_gb: 20
@@ -361,6 +409,9 @@ darwin_dev_caches:
 
 	if !cfg.Enable.DevArtifacts {
 		t.Error("Enable.DevArtifacts should be true")
+	}
+	if !cfg.Enable.Bazel {
+		t.Error("Enable.Bazel should be true")
 	}
 	if !cfg.Enable.APFSSnapshots {
 		t.Error("Enable.APFSSnapshots should be true")
@@ -427,6 +478,33 @@ darwin_dev_caches:
 	}
 	if cfg.Nix.MaxGCDuration != "10m" {
 		t.Errorf("Nix.MaxGCDuration should be 10m per config, got %q", cfg.Nix.MaxGCDuration)
+	}
+	if len(cfg.Bazel.Roots) != 1 || cfg.Bazel.Roots[0] != "~/custom-bazel" {
+		t.Errorf("unexpected Bazel.Roots: %#v", cfg.Bazel.Roots)
+	}
+	if cfg.Bazel.BazeliskCache != "~/custom-bazelisk" {
+		t.Errorf("Bazel.BazeliskCache should be custom path, got %q", cfg.Bazel.BazeliskCache)
+	}
+	if cfg.Bazel.MaxTotalGB != 30 {
+		t.Errorf("Bazel.MaxTotalGB should be 30 per config, got %d", cfg.Bazel.MaxTotalGB)
+	}
+	if cfg.Bazel.KeepRecentOutputBases != 2 {
+		t.Errorf("Bazel.KeepRecentOutputBases should be 2 per config, got %d", cfg.Bazel.KeepRecentOutputBases)
+	}
+	if cfg.Bazel.StaleAfter != "10d" {
+		t.Errorf("Bazel.StaleAfter should be 10d per config, got %q", cfg.Bazel.StaleAfter)
+	}
+	if cfg.Bazel.CriticalStaleAfter != "2d" {
+		t.Errorf("Bazel.CriticalStaleAfter should be 2d per config, got %q", cfg.Bazel.CriticalStaleAfter)
+	}
+	if len(cfg.Bazel.ProtectWorkspaces) != 1 || cfg.Bazel.ProtectWorkspaces[0] != "~/git/important" {
+		t.Errorf("unexpected Bazel.ProtectWorkspaces: %#v", cfg.Bazel.ProtectWorkspaces)
+	}
+	if cfg.Bazel.AllowStopIdleServers {
+		t.Error("Bazel.AllowStopIdleServers should be false per config")
+	}
+	if !cfg.Bazel.AllowDeleteActiveOutputBases {
+		t.Error("Bazel.AllowDeleteActiveOutputBases should be true per config")
 	}
 	if !cfg.DarwinDevCaches.Enabled {
 		t.Error("DarwinDevCaches.Enabled should be true per config")

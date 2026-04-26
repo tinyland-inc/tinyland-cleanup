@@ -518,6 +518,7 @@ func registerPlugins(registry *plugins.Registry) {
 	registry.Register(plugins.NewDockerPlugin())
 	registry.Register(plugins.NewPodmanPlugin())
 	registry.Register(plugins.NewNixPlugin())
+	registry.Register(plugins.NewBazelPlugin())
 	registry.Register(plugins.NewCachePlugin())
 	registry.Register(plugins.NewGitLabRunnerPlugin())
 
