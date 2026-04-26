@@ -37,6 +37,9 @@ All notable changes to this project will be documented in this file.
   Bazelisk, and pip cache targets.
 - Nix low-reclaim dry-runs now emit protected GC-root attribution targets so
   operators can see what is pinning the store before taking action.
+- Human-readable `--output text` reports now explain dry-run and cleanup cycles
+  with mount status, host free-space accounting, plugin plans, warnings, and
+  representative targets.
 
 ### Changed
 

@@ -573,12 +573,15 @@ func (d *daemon) primaryMonitorPath(assessment mountAssessment) string {
 }
 
 func (d *daemon) writeReport(report cycleReport) error {
-	if d.output != "json" {
-		return nil
+	if d.output == "json" {
+		encoder := json.NewEncoder(d.report)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(report)
 	}
-	encoder := json.NewEncoder(d.report)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(report)
+	if d.output == "text" {
+		return writeTextReport(d.report, report)
+	}
+	return nil
 }
 
 func (d *daemon) getDiskStats(path string) (*monitor.DiskStats, error) {
