@@ -47,6 +47,9 @@ type Config struct {
 	// Dev artifact cleanup settings
 	DevArtifacts DevArtifactsConfig `yaml:"dev_artifacts"`
 
+	// Darwin developer cache cleanup settings
+	DarwinDevCaches DarwinDevCachesConfig `yaml:"darwin_dev_caches"`
+
 	// APFS snapshot settings (Darwin)
 	APFS APFSConfig `yaml:"apfs"`
 
@@ -190,6 +193,38 @@ type DevArtifactsConfig struct {
 	ProtectPaths []string `yaml:"protect_paths"`
 }
 
+// DarwinDevCachesConfig holds macOS developer-cache budget settings.
+type DarwinDevCachesConfig struct {
+	// Enabled controls typed Darwin developer-cache planning.
+	Enabled bool `yaml:"enabled"`
+	// MaxTotalGB is the review budget across known Darwin developer caches.
+	MaxTotalGB int `yaml:"max_total_gb"`
+	// JetBrains controls JetBrains cache planning.
+	JetBrains DarwinDevCacheToolConfig `yaml:"jetbrains"`
+	// Playwright controls Playwright browser cache planning.
+	Playwright DarwinDevCacheToolConfig `yaml:"playwright"`
+	// Bazelisk controls Bazelisk download cache planning.
+	Bazelisk DarwinDevCacheToolConfig `yaml:"bazelisk"`
+	// Pip controls pip cache planning.
+	Pip DarwinDevCacheToolConfig `yaml:"pip"`
+}
+
+// DarwinDevCacheToolConfig holds per-tool cache budget settings.
+type DarwinDevCacheToolConfig struct {
+	// Enabled controls this cache family.
+	Enabled bool `yaml:"enabled"`
+	// MaxGB is the review budget for this cache family.
+	MaxGB int `yaml:"max_gb,omitempty"`
+	// StaleAfterDays is the age after which entries become cleanup candidates.
+	StaleAfterDays int `yaml:"stale_after_days,omitempty"`
+	// KeepLatest keeps this many newest entries when versioned.
+	KeepLatest int `yaml:"keep_latest,omitempty"`
+	// KeepLatestPerFamily keeps the newest entry for each detected browser/tool family.
+	KeepLatestPerFamily bool `yaml:"keep_latest_per_family,omitempty"`
+	// KeepActiveVersions preserves versions with active-use evidence.
+	KeepActiveVersions bool `yaml:"keep_active_versions,omitempty"`
+}
+
 // APFSConfig holds APFS snapshot cleanup settings (Darwin).
 type APFSConfig struct {
 	// ThinEnabled enables APFS snapshot thinning
@@ -277,6 +312,28 @@ func DefaultConfig() *Config {
 			HaskellCache:   true,
 			LMStudioModels: false,
 			ProtectPaths:   []string{},
+		},
+		DarwinDevCaches: DarwinDevCachesConfig{
+			Enabled:    runtime.GOOS == "darwin",
+			MaxTotalGB: 15,
+			JetBrains: DarwinDevCacheToolConfig{
+				Enabled:            true,
+				MaxGB:              8,
+				StaleAfterDays:     14,
+				KeepActiveVersions: true,
+			},
+			Playwright: DarwinDevCacheToolConfig{
+				Enabled:             true,
+				KeepLatestPerFamily: true,
+			},
+			Bazelisk: DarwinDevCacheToolConfig{
+				Enabled:    true,
+				KeepLatest: 2,
+			},
+			Pip: DarwinDevCacheToolConfig{
+				Enabled:        true,
+				StaleAfterDays: 14,
+			},
 		},
 		APFS: APFSConfig{
 			ThinEnabled:     true,

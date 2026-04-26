@@ -61,6 +61,9 @@ shrink from guest `fstrim` alone. See
 [docs/podman-darwin-compaction.md](docs/podman-darwin-compaction.md) before
 enabling offline compaction.
 
+Darwin developer cache review is documented in
+[docs/darwin-dev-caches.md](docs/darwin-dev-caches.md).
+
 ## Distribution Status
 
 Current package authority is the Nix flake package `.#tinyland-cleanup`.

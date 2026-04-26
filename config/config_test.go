@@ -233,6 +233,34 @@ func TestPodmanCompactDefaults(t *testing.T) {
 	}
 }
 
+func TestDarwinDevCacheDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+	if runtime.GOOS == "darwin" && !cfg.DarwinDevCaches.Enabled {
+		t.Error("DarwinDevCaches.Enabled should default to true on Darwin")
+	}
+	if runtime.GOOS != "darwin" && cfg.DarwinDevCaches.Enabled {
+		t.Error("DarwinDevCaches.Enabled should default to false outside Darwin")
+	}
+	if cfg.DarwinDevCaches.MaxTotalGB != 15 {
+		t.Errorf("DarwinDevCaches.MaxTotalGB should default to 15, got %d", cfg.DarwinDevCaches.MaxTotalGB)
+	}
+	if !cfg.DarwinDevCaches.JetBrains.Enabled {
+		t.Error("DarwinDevCaches.JetBrains.Enabled should default to true")
+	}
+	if cfg.DarwinDevCaches.JetBrains.MaxGB != 8 {
+		t.Errorf("DarwinDevCaches.JetBrains.MaxGB should default to 8, got %d", cfg.DarwinDevCaches.JetBrains.MaxGB)
+	}
+	if !cfg.DarwinDevCaches.JetBrains.KeepActiveVersions {
+		t.Error("DarwinDevCaches.JetBrains.KeepActiveVersions should default to true")
+	}
+	if !cfg.DarwinDevCaches.Playwright.KeepLatestPerFamily {
+		t.Error("DarwinDevCaches.Playwright.KeepLatestPerFamily should default to true")
+	}
+	if cfg.DarwinDevCaches.Bazelisk.KeepLatest != 2 {
+		t.Errorf("DarwinDevCaches.Bazelisk.KeepLatest should default to 2, got %d", cfg.DarwinDevCaches.Bazelisk.KeepLatest)
+	}
+}
+
 func TestLoadConfigWithNewFields(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -266,6 +294,23 @@ podman:
   compact_keep_backup_until_restart: false
   compact_provider_allowlist:
     - applehv
+darwin_dev_caches:
+  enabled: true
+  max_total_gb: 20
+  jetbrains:
+    enabled: true
+    max_gb: 10
+    stale_after_days: 21
+    keep_active_versions: true
+  playwright:
+    enabled: false
+    keep_latest_per_family: false
+  bazelisk:
+    enabled: true
+    keep_latest: 3
+  pip:
+    enabled: true
+    stale_after_days: 7
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatal(err)
@@ -320,5 +365,26 @@ podman:
 	}
 	if len(cfg.Podman.CompactProviderAllowlist) != 1 || cfg.Podman.CompactProviderAllowlist[0] != "applehv" {
 		t.Errorf("unexpected Podman.CompactProviderAllowlist: %#v", cfg.Podman.CompactProviderAllowlist)
+	}
+	if !cfg.DarwinDevCaches.Enabled {
+		t.Error("DarwinDevCaches.Enabled should be true per config")
+	}
+	if cfg.DarwinDevCaches.MaxTotalGB != 20 {
+		t.Errorf("DarwinDevCaches.MaxTotalGB should be 20 per config, got %d", cfg.DarwinDevCaches.MaxTotalGB)
+	}
+	if cfg.DarwinDevCaches.JetBrains.MaxGB != 10 {
+		t.Errorf("DarwinDevCaches.JetBrains.MaxGB should be 10 per config, got %d", cfg.DarwinDevCaches.JetBrains.MaxGB)
+	}
+	if cfg.DarwinDevCaches.JetBrains.StaleAfterDays != 21 {
+		t.Errorf("DarwinDevCaches.JetBrains.StaleAfterDays should be 21 per config, got %d", cfg.DarwinDevCaches.JetBrains.StaleAfterDays)
+	}
+	if cfg.DarwinDevCaches.Playwright.Enabled {
+		t.Error("DarwinDevCaches.Playwright.Enabled should be false per config")
+	}
+	if cfg.DarwinDevCaches.Bazelisk.KeepLatest != 3 {
+		t.Errorf("DarwinDevCaches.Bazelisk.KeepLatest should be 3 per config, got %d", cfg.DarwinDevCaches.Bazelisk.KeepLatest)
+	}
+	if cfg.DarwinDevCaches.Pip.StaleAfterDays != 7 {
+		t.Errorf("DarwinDevCaches.Pip.StaleAfterDays should be 7 per config, got %d", cfg.DarwinDevCaches.Pip.StaleAfterDays)
 	}
 }
