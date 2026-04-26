@@ -30,6 +30,9 @@ All notable changes to this project will be documented in this file.
   and release workflow RPM artifacts.
 - Persistent daemon cleanup state with per-plugin cooldowns for non-critical
   daemon-triggered cleanup cycles.
+- Structured dry-run targets for development artifacts such as stale
+  `node_modules`, Python virtualenvs, Rust `target/` directories, Go build
+  cache, Haskell caches, and opt-in LM Studio model caches.
 
 ### Changed
 

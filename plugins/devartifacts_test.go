@@ -275,6 +275,92 @@ func TestCleanupWarningLevel(t *testing.T) {
 	}
 }
 
+func TestPlanCleanupWarningReportsDevArtifacts(t *testing.T) {
+	p := NewDevArtifactsPlugin()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	tmpDir := t.TempDir()
+	project := filepath.Join(tmpDir, "old-project")
+	os.MkdirAll(filepath.Join(project, "node_modules", "pkg"), 0755)
+	os.WriteFile(filepath.Join(project, "node_modules", "pkg", "index.js"), []byte("test"), 0644)
+	packageJSON := filepath.Join(project, "package.json")
+	os.WriteFile(packageJSON, []byte(`{"name":"old"}`), 0644)
+	oldTime := time.Now().Add(-60 * 24 * time.Hour)
+	os.Chtimes(packageJSON, oldTime, oldTime)
+
+	cfg := config.DefaultConfig()
+	cfg.DevArtifacts.ScanPaths = []string{tmpDir}
+	cfg.DevArtifacts.PythonVenvs = false
+	cfg.DevArtifacts.RustTargets = false
+	cfg.DevArtifacts.GoBuildCache = false
+	cfg.DevArtifacts.HaskellCache = false
+
+	plan := p.PlanCleanup(context.Background(), LevelWarning, cfg, logger)
+	target := findDevArtifactTarget(t, plan.Targets, "node_modules", filepath.Join(project, "node_modules"))
+	if target.Action != "report" {
+		t.Fatalf("expected report action at warning, got %#v", target)
+	}
+	if plan.EstimatedBytesFreed != 0 {
+		t.Fatalf("warning plan should not estimate freed bytes, got %d", plan.EstimatedBytesFreed)
+	}
+	if plan.Metadata["mutates"] != "false" {
+		t.Fatalf("expected mutates=false metadata, got %#v", plan.Metadata)
+	}
+}
+
+func TestPlanCleanupModerateClassifiesDevArtifacts(t *testing.T) {
+	p := NewDevArtifactsPlugin()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	tmpDir := t.TempDir()
+
+	oldProject := filepath.Join(tmpDir, "old-project")
+	os.MkdirAll(filepath.Join(oldProject, "node_modules", "pkg"), 0755)
+	os.WriteFile(filepath.Join(oldProject, "node_modules", "pkg", "index.js"), []byte("test"), 0644)
+	oldPackageJSON := filepath.Join(oldProject, "package.json")
+	os.WriteFile(oldPackageJSON, []byte(`{"name":"old"}`), 0644)
+	oldTime := time.Now().Add(-60 * 24 * time.Hour)
+	os.Chtimes(oldPackageJSON, oldTime, oldTime)
+
+	freshProject := filepath.Join(tmpDir, "fresh-project")
+	os.MkdirAll(filepath.Join(freshProject, "node_modules", "pkg"), 0755)
+	os.WriteFile(filepath.Join(freshProject, "node_modules", "pkg", "index.js"), []byte("test"), 0644)
+	os.WriteFile(filepath.Join(freshProject, "package.json"), []byte(`{"name":"fresh"}`), 0644)
+
+	protectedProject := filepath.Join(tmpDir, "protected-project")
+	os.MkdirAll(filepath.Join(protectedProject, "node_modules", "pkg"), 0755)
+	os.WriteFile(filepath.Join(protectedProject, "node_modules", "pkg", "index.js"), []byte("test"), 0644)
+	protectedPackageJSON := filepath.Join(protectedProject, "package.json")
+	os.WriteFile(protectedPackageJSON, []byte(`{"name":"protected"}`), 0644)
+	os.Chtimes(protectedPackageJSON, oldTime, oldTime)
+
+	cfg := config.DefaultConfig()
+	cfg.DevArtifacts.ScanPaths = []string{tmpDir}
+	cfg.DevArtifacts.PythonVenvs = false
+	cfg.DevArtifacts.RustTargets = false
+	cfg.DevArtifacts.GoBuildCache = false
+	cfg.DevArtifacts.HaskellCache = false
+	cfg.DevArtifacts.ProtectPaths = []string{protectedProject}
+
+	plan := p.PlanCleanup(context.Background(), LevelModerate, cfg, logger)
+	oldTarget := findDevArtifactTarget(t, plan.Targets, "node_modules", filepath.Join(oldProject, "node_modules"))
+	if oldTarget.Action != "delete" || oldTarget.Protected {
+		t.Fatalf("expected old node_modules delete target, got %#v", oldTarget)
+	}
+	freshTarget := findDevArtifactTarget(t, plan.Targets, "node_modules", filepath.Join(freshProject, "node_modules"))
+	if freshTarget.Action != "protect" || !freshTarget.Protected {
+		t.Fatalf("expected fresh node_modules protected, got %#v", freshTarget)
+	}
+	protectedTarget := findDevArtifactTarget(t, plan.Targets, "node_modules", filepath.Join(protectedProject, "node_modules"))
+	if protectedTarget.Action != "protect" || !protectedTarget.Protected {
+		t.Fatalf("expected configured protected path to be protected, got %#v", protectedTarget)
+	}
+	if plan.EstimatedBytesFreed <= 0 {
+		t.Fatal("expected positive estimated freed bytes for stale delete target")
+	}
+	if plan.Metadata["mutates"] != "true" {
+		t.Fatalf("expected mutates=true metadata, got %#v", plan.Metadata)
+	}
+}
+
 func TestGetGoCacheDir(t *testing.T) {
 	p := NewDevArtifactsPlugin()
 
@@ -289,4 +375,15 @@ func TestGetGoCacheDir(t *testing.T) {
 	// May or may not return a value depending on environment
 	// Just verify it doesn't panic
 	_ = dir
+}
+
+func findDevArtifactTarget(t *testing.T, targets []CleanupTarget, targetType, path string) CleanupTarget {
+	t.Helper()
+	for _, target := range targets {
+		if target.Type == targetType && target.Path == path {
+			return target
+		}
+	}
+	t.Fatalf("target %s at %s not found in %#v", targetType, path, targets)
+	return CleanupTarget{}
 }
