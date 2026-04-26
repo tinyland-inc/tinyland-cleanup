@@ -45,6 +45,8 @@ All notable changes to this project will be documented in this file.
 - Bazel cache-tier budget enforcement for stale repository cache, disk cache,
   and Bazelisk download targets when total Bazel footprint exceeds the
   configured budget.
+- Active-process protection for development artifact cleanup families such as
+  Node.js, Python, Rust, Go, Haskell, and LM Studio.
 
 ### Changed
 

@@ -100,6 +100,8 @@ targets such as `node_modules`, Python virtualenvs, Rust `target/` directories,
 Go build cache, Haskell caches, and opt-in LM Studio model caches. Warning
 level reports only; moderate and above mark eligible stale artifacts as
 deletion or cache-clean targets while preserving configured protected paths.
+The plan also protects matching artifact families when active package manager,
+compiler, language server, runtime, or LM Studio processes are visible.
 
 ## Current Boundary
 
