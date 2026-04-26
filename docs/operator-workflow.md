@@ -20,6 +20,14 @@ Use JSON when another tool needs the stable report schema:
 tinyland-cleanup --once --dry-run --level critical --output json
 ```
 
+List registered plugin names and whether they are enabled for the current
+config before choosing a bounded evidence run:
+
+```sh
+tinyland-cleanup --list-plugins
+tinyland-cleanup --list-plugins --output json
+```
+
 When gathering evidence on an active workstation, constrain the run to the
 plugin family under review instead of scanning every enabled cache surface:
 
