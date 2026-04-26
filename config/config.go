@@ -150,6 +150,14 @@ type PodmanConfig struct {
 	TrimVMDisk bool `yaml:"trim_vm_disk"`
 	// CompactDiskOffline enables offline raw disk compaction at Critical level
 	CompactDiskOffline bool `yaml:"compact_disk_offline"`
+	// CompactMinReclaimGB is the minimum physical allocation worth compacting
+	CompactMinReclaimGB int `yaml:"compact_min_reclaim_gb"`
+	// CompactRequireNoActiveContainers skips offline compaction when containers are running
+	CompactRequireNoActiveContainers bool `yaml:"compact_require_no_active_containers"`
+	// CompactKeepBackupUntilRestart preserves the original image until restart verifies the compacted image
+	CompactKeepBackupUntilRestart bool `yaml:"compact_keep_backup_until_restart"`
+	// CompactProviderAllowlist restricts offline compaction to known providers
+	CompactProviderAllowlist []string `yaml:"compact_provider_allowlist"`
 }
 
 // ICloudConfig holds iCloud-specific cleanup settings (Darwin).
@@ -224,14 +232,14 @@ func DefaultConfig() *Config {
 		TargetFree: 70,
 		LogFile:    logFile,
 		Enable: EnableFlags{
-			Cache:        true,
-			NixGC:        true,
-			Docker:       true,
-			Podman:       true,
-			Lima:         runtime.GOOS == "darwin",
-			Homebrew:     runtime.GOOS == "darwin",
-			IOSSimulator: runtime.GOOS == "darwin",
-			GitLabRunner: true,
+			Cache:         true,
+			NixGC:         true,
+			Docker:        true,
+			Podman:        true,
+			Lima:          runtime.GOOS == "darwin",
+			Homebrew:      runtime.GOOS == "darwin",
+			IOSSimulator:  runtime.GOOS == "darwin",
+			GitLabRunner:  true,
 			ICloud:        runtime.GOOS == "darwin",
 			Photos:        runtime.GOOS == "darwin",
 			DevArtifacts:  true,
@@ -242,11 +250,15 @@ func DefaultConfig() *Config {
 			ProtectRunningContainers: true,
 		},
 		Podman: PodmanConfig{
-			PruneImagesAge:           "24h",
-			ProtectRunningContainers: true,
-			MachineNames:             []string{"podman-machine-default"},
-			CleanInsideVM:            true,
-			TrimVMDisk:               true,
+			PruneImagesAge:                   "24h",
+			ProtectRunningContainers:         true,
+			MachineNames:                     []string{"podman-machine-default"},
+			CleanInsideVM:                    true,
+			TrimVMDisk:                       true,
+			CompactMinReclaimGB:              8,
+			CompactRequireNoActiveContainers: true,
+			CompactKeepBackupUntilRestart:    true,
+			CompactProviderAllowlist:         []string{"applehv", "libkrun", "qemu"},
 		},
 		Lima: LimaConfig{
 			VMNames: []string{"colima", "unified"},
@@ -267,9 +279,9 @@ func DefaultConfig() *Config {
 			ProtectPaths:   []string{},
 		},
 		APFS: APFSConfig{
-			ThinEnabled:    true,
-			MaxThinGB:      50,
-			KeepRecentDays: 1,
+			ThinEnabled:     true,
+			MaxThinGB:       50,
+			KeepRecentDays:  1,
 			DeleteOSUpdates: true,
 		},
 		Notify: NotifyConfig{

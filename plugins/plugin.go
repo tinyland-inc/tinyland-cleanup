@@ -63,6 +63,30 @@ type CleanupResult struct {
 	Error error
 }
 
+// CleanupPlan describes what a dry-run cleanup cycle would do.
+type CleanupPlan struct {
+	// Plugin is the plugin that produced the plan.
+	Plugin string `json:"plugin"`
+	// Level is the cleanup level being planned.
+	Level string `json:"level"`
+	// Summary is a short human-readable plan summary.
+	Summary string `json:"summary"`
+	// WouldRun reports whether the planned action is currently eligible.
+	WouldRun bool `json:"would_run"`
+	// SkipReason explains why the planned action is not eligible.
+	SkipReason string `json:"skip_reason,omitempty"`
+	// EstimatedBytesFreed is the best available reclaim estimate.
+	EstimatedBytesFreed int64 `json:"estimated_bytes_freed,omitempty"`
+	// RequiredFreeBytes is the host free space needed before the action.
+	RequiredFreeBytes int64 `json:"required_free_bytes,omitempty"`
+	// Steps lists the operator-visible steps the cleanup would perform.
+	Steps []string `json:"steps,omitempty"`
+	// Warnings lists safety warnings or lossy accounting caveats.
+	Warnings []string `json:"warnings,omitempty"`
+	// Metadata carries plugin-specific plan facts.
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
 // Plugin is the interface that cleanup plugins must implement.
 type Plugin interface {
 	// Name returns the plugin's unique identifier
@@ -82,6 +106,11 @@ type Plugin interface {
 	// level indicates the severity of cleanup needed
 	// ctx allows cancellation of long-running operations
 	Cleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult
+}
+
+// Planner is implemented by plugins that can produce a detailed dry-run plan.
+type Planner interface {
+	PlanCleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupPlan
 }
 
 // Registry holds registered cleanup plugins.

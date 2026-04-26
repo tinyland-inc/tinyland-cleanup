@@ -56,6 +56,11 @@ tinyland-cleanup --once --dry-run --level critical --output json
 See [docs/operator-workflow.md](docs/operator-workflow.md) for the current
 dry-run and host free-space accounting workflow.
 
+Podman on macOS needs extra care because `applehv` raw sparse images do not
+shrink from guest `fstrim` alone. See
+[docs/podman-darwin-compaction.md](docs/podman-darwin-compaction.md) before
+enabling offline compaction.
+
 ## Distribution Status
 
 Current package authority is the Nix flake package `.#tinyland-cleanup`.

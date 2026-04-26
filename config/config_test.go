@@ -219,6 +219,18 @@ func TestPodmanCompactDefaults(t *testing.T) {
 	if cfg.Podman.CompactDiskOffline {
 		t.Error("Podman.CompactDiskOffline should be false by default (opt-in)")
 	}
+	if cfg.Podman.CompactMinReclaimGB != 8 {
+		t.Errorf("Podman.CompactMinReclaimGB should default to 8, got %d", cfg.Podman.CompactMinReclaimGB)
+	}
+	if !cfg.Podman.CompactRequireNoActiveContainers {
+		t.Error("Podman.CompactRequireNoActiveContainers should default to true")
+	}
+	if !cfg.Podman.CompactKeepBackupUntilRestart {
+		t.Error("Podman.CompactKeepBackupUntilRestart should default to true")
+	}
+	if len(cfg.Podman.CompactProviderAllowlist) == 0 {
+		t.Fatal("Podman.CompactProviderAllowlist should have defaults")
+	}
 }
 
 func TestLoadConfigWithNewFields(t *testing.T) {
@@ -249,6 +261,11 @@ lima:
   compact_offline: true
 podman:
   compact_disk_offline: true
+  compact_min_reclaim_gb: 12
+  compact_require_no_active_containers: false
+  compact_keep_backup_until_restart: false
+  compact_provider_allowlist:
+    - applehv
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatal(err)
@@ -291,5 +308,17 @@ podman:
 	}
 	if !cfg.Podman.CompactDiskOffline {
 		t.Error("Podman.CompactDiskOffline should be true per config")
+	}
+	if cfg.Podman.CompactMinReclaimGB != 12 {
+		t.Errorf("Podman.CompactMinReclaimGB should be 12 per config, got %d", cfg.Podman.CompactMinReclaimGB)
+	}
+	if cfg.Podman.CompactRequireNoActiveContainers {
+		t.Error("Podman.CompactRequireNoActiveContainers should be false per config")
+	}
+	if cfg.Podman.CompactKeepBackupUntilRestart {
+		t.Error("Podman.CompactKeepBackupUntilRestart should be false per config")
+	}
+	if len(cfg.Podman.CompactProviderAllowlist) != 1 || cfg.Podman.CompactProviderAllowlist[0] != "applehv" {
+		t.Errorf("unexpected Podman.CompactProviderAllowlist: %#v", cfg.Podman.CompactProviderAllowlist)
 	}
 }

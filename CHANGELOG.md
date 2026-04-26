@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
 - Shared-cache Bazel wrapper for GloriousFlywheel runner attachment.
 - JSON cleanup cycle reports with dry-run plugin plans and host free-space
   accounting.
+- Podman offline compaction preflight for Darwin VM disks, including physical
+  allocation accounting and active-container safety gates.
 
 ### Changed
 

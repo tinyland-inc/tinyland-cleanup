@@ -40,6 +40,48 @@ type PodmanEnvironment struct {
 	SocketPath string
 }
 
+const podmanCompactionGiB = int64(1024 * 1024 * 1024)
+
+type podmanCompactionPlan struct {
+	MachineName               string
+	Provider                  string
+	DiskFormat                string
+	DiskPath                  string
+	TempPath                  string
+	BackupPath                string
+	ConfigEnabled             bool
+	QemuImgAvailable          bool
+	ActiveContainers          bool
+	ActiveContainerCheckError string
+	DiskPathExpected          bool
+	BackupExists              bool
+	LogicalBytes              int64
+	PhysicalBytes             int64
+	FreeBytes                 int64
+	RequiredFreeBytes         int64
+	EstimatedReclaimBytes     int64
+	CanCompact                bool
+	SkipReason                string
+	Warnings                  []string
+	Steps                     []string
+}
+
+type podmanCompactionPlanInput struct {
+	MachineName               string
+	Provider                  string
+	DiskPath                  string
+	ConfigEnabled             bool
+	QemuImgAvailable          bool
+	ActiveContainers          bool
+	ActiveContainerCheckError string
+	DiskPathExpected          bool
+	BackupExists              bool
+	LogicalBytes              int64
+	PhysicalBytes             int64
+	FreeBytes                 int64
+	Config                    config.PodmanConfig
+}
+
 // NewPodmanPlugin creates a new Podman cleanup plugin.
 func NewPodmanPlugin() *PodmanPlugin {
 	return &PodmanPlugin{}
@@ -63,6 +105,106 @@ func (p *PodmanPlugin) SupportedPlatforms() []string {
 // Enabled checks if Podman cleanup is enabled.
 func (p *PodmanPlugin) Enabled(cfg *config.Config) bool {
 	return cfg.Enable.Podman
+}
+
+// PlanCleanup returns a dry-run plan without mutating Podman state.
+func (p *PodmanPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupPlan {
+	plan := CleanupPlan{
+		Plugin:   p.Name(),
+		Level:    level.String(),
+		Summary:  "Podman cleanup plan",
+		WouldRun: true,
+		Metadata: map[string]string{
+			"cleanup_level": level.String(),
+		},
+	}
+
+	if p.environment == nil {
+		env, err := detectPodmanEnvironment()
+		if err != nil {
+			plan.WouldRun = false
+			plan.SkipReason = "environment_detection_failed"
+			plan.Summary = "Podman environment could not be inspected"
+			plan.Warnings = append(plan.Warnings, err.Error())
+			return plan
+		}
+		p.environment = env
+	}
+
+	if p.environment.Runtime != "podman" {
+		plan.WouldRun = false
+		plan.SkipReason = "podman_not_available"
+		plan.Summary = "Podman is not available"
+		return plan
+	}
+
+	plan.Metadata["needs_vm"] = strconv.FormatBool(p.environment.NeedsVM)
+	plan.Metadata["vm_provider"] = p.environment.VMProvider
+	plan.Metadata["vm_running"] = strconv.FormatBool(p.environment.VMRunning)
+	plan.Metadata["machine_name"] = p.environment.MachineName
+
+	if p.environment.NeedsVM && !p.environment.VMRunning {
+		plan.WouldRun = false
+		plan.SkipReason = "podman_machine_not_running"
+		plan.Summary = "Podman machine is not running"
+		return plan
+	}
+
+	switch level {
+	case LevelWarning:
+		plan.Steps = append(plan.Steps, "Prune dangling Podman images")
+	case LevelModerate:
+		plan.Steps = append(plan.Steps,
+			"Prune dangling Podman images",
+			fmt.Sprintf("Prune Podman images older than %s", cfg.Podman.PruneImagesAge),
+			"Prune old stopped Podman containers",
+			"Prune Podman build cache",
+		)
+	case LevelAggressive:
+		plan.Steps = append(plan.Steps,
+			"Run moderate Podman cleanup",
+			"Prune unused Podman volumes",
+			"Prune Podman build containers",
+		)
+		if runtime.GOOS == "darwin" && p.environment.VMRunning && cfg.Podman.TrimVMDisk && !p.fstrimReclaimsHostSpace() {
+			plan.Warnings = append(plan.Warnings, "guest fstrim is not counted as host reclaim for this provider")
+		}
+	case LevelCritical:
+		plan.Steps = append(plan.Steps,
+			"Run full Podman system prune with volumes",
+			"Prune external Podman storage when supported",
+		)
+		if runtime.GOOS == "darwin" && p.environment.VMRunning {
+			if cfg.Podman.CleanInsideVM {
+				plan.Steps = append(plan.Steps, "Run critical cleanup inside the Podman VM")
+			}
+			if cfg.Podman.TrimVMDisk && !p.fstrimReclaimsHostSpace() {
+				plan.Warnings = append(plan.Warnings, "guest fstrim is not counted as host reclaim for this provider")
+			}
+
+			compaction := p.planOfflineCompaction(ctx, cfg, logger)
+			plan.RequiredFreeBytes = compaction.RequiredFreeBytes
+			plan.EstimatedBytesFreed = compaction.EstimatedReclaimBytes
+			plan.Warnings = append(plan.Warnings, compaction.Warnings...)
+			plan.Steps = append(plan.Steps, compaction.Steps...)
+			plan.Metadata["offline_compaction_enabled"] = strconv.FormatBool(compaction.ConfigEnabled)
+			plan.Metadata["offline_compaction_can_run"] = strconv.FormatBool(compaction.CanCompact)
+			plan.Metadata["offline_compaction_skip_reason"] = compaction.SkipReason
+			plan.Metadata["offline_compaction_provider"] = compaction.Provider
+			plan.Metadata["offline_compaction_format"] = compaction.DiskFormat
+			plan.Metadata["offline_compaction_disk_path"] = compaction.DiskPath
+			plan.Metadata["offline_compaction_temp_path"] = compaction.TempPath
+			plan.Metadata["offline_compaction_backup_path"] = compaction.BackupPath
+			plan.Metadata["offline_compaction_logical_bytes"] = strconv.FormatInt(compaction.LogicalBytes, 10)
+			plan.Metadata["offline_compaction_physical_bytes"] = strconv.FormatInt(compaction.PhysicalBytes, 10)
+			plan.Metadata["offline_compaction_free_bytes"] = strconv.FormatInt(compaction.FreeBytes, 10)
+			plan.Metadata["offline_compaction_required_free_bytes"] = strconv.FormatInt(compaction.RequiredFreeBytes, 10)
+			plan.Metadata["offline_compaction_estimated_reclaim_bytes"] = strconv.FormatInt(compaction.EstimatedReclaimBytes, 10)
+			plan.Metadata["offline_compaction_active_containers"] = strconv.FormatBool(compaction.ActiveContainers)
+		}
+	}
+
+	return plan
 }
 
 // Cleanup performs Podman cleanup at the specified level.
@@ -268,11 +410,12 @@ func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, lo
 
 		// Offline disk compaction (opt-in only)
 		if cfg.Podman.CompactDiskOffline {
-			compactFreed, err := p.compactRawDisk(ctx, logger)
+			compactFreed, err := p.compactRawDisk(ctx, cfg, logger)
 			if err != nil {
 				logger.Warn("Podman disk compaction failed", "error", err)
 			} else if compactFreed > 0 {
 				result.BytesFreed += compactFreed
+				result.HostBytesFreed += compactFreed
 				result.ItemsCleaned++
 			}
 		} else if p.environment.VMProvider == "qemu" {
@@ -486,66 +629,287 @@ func parseFstrimOutput(output string) int64 {
 	return total
 }
 
+func (p *PodmanPlugin) planOfflineCompaction(ctx context.Context, cfg *config.Config, logger *slog.Logger) podmanCompactionPlan {
+	input := podmanCompactionPlanInput{
+		MachineName:      p.environment.MachineName,
+		Provider:         p.environment.VMProvider,
+		ConfigEnabled:    cfg.Podman.CompactDiskOffline,
+		QemuImgAvailable: commandAvailable("qemu-img"),
+		Config:           cfg.Podman,
+	}
+
+	diskPath, err := p.getMachineDiskPath(ctx)
+	if err != nil {
+		logger.Debug("Podman disk path preflight failed", "error", err)
+		input.DiskPathExpected = false
+		plan := buildPodmanCompactionPlan(input)
+		plan.SkipReason = "disk_path_unavailable"
+		plan.Warnings = append(plan.Warnings, err.Error())
+		return plan
+	}
+	input.DiskPath = diskPath
+	input.DiskPathExpected = expectedPodmanMachineDiskPath(diskPath)
+	input.BackupExists = pathExists(diskPath + ".backup")
+
+	if stat, err := os.Stat(diskPath); err == nil {
+		input.LogicalBytes = stat.Size()
+	} else {
+		logger.Debug("Podman disk stat preflight failed", "disk", diskPath, "error", err)
+		plan := buildPodmanCompactionPlan(input)
+		plan.SkipReason = "disk_stat_failed"
+		plan.Warnings = append(plan.Warnings, err.Error())
+		return plan
+	}
+
+	if allocated, err := getFileAllocatedBytes(diskPath); err == nil {
+		input.PhysicalBytes = allocated
+	} else {
+		logger.Debug("Podman disk allocation preflight failed", "disk", diskPath, "error", err)
+		input.PhysicalBytes = input.LogicalBytes
+	}
+
+	if free, err := getFreeDiskSpace(filepath.Dir(diskPath)); err == nil {
+		input.FreeBytes = int64FromUint64(free)
+	} else {
+		logger.Debug("Podman disk free-space preflight failed", "disk", diskPath, "error", err)
+		plan := buildPodmanCompactionPlan(input)
+		plan.SkipReason = "free_space_check_failed"
+		plan.Warnings = append(plan.Warnings, err.Error())
+		return plan
+	}
+
+	if cfg.Podman.CompactRequireNoActiveContainers {
+		active, err := p.hasActiveContainers(ctx)
+		input.ActiveContainers = active
+		if err != nil {
+			input.ActiveContainerCheckError = err.Error()
+		}
+	}
+
+	return buildPodmanCompactionPlan(input)
+}
+
+func buildPodmanCompactionPlan(input podmanCompactionPlanInput) podmanCompactionPlan {
+	diskFormat, supportedProvider := podmanDiskFormat(input.Provider)
+	tempPath := ""
+	backupPath := ""
+	if input.DiskPath != "" {
+		tempPath = input.DiskPath + ".compact"
+		backupPath = input.DiskPath + ".backup"
+	}
+
+	physicalBytes := input.PhysicalBytes
+	if physicalBytes <= 0 {
+		physicalBytes = input.LogicalBytes
+	}
+
+	requiredFreeBytes := podmanCompactionRequiredFreeBytes(physicalBytes)
+	minReclaimBytes := int64(input.Config.CompactMinReclaimGB) * podmanCompactionGiB
+	estimatedReclaimBytes := physicalBytes
+	if minReclaimBytes > 0 && estimatedReclaimBytes > 0 && estimatedReclaimBytes > minReclaimBytes {
+		estimatedReclaimBytes -= minReclaimBytes
+	} else {
+		estimatedReclaimBytes = 0
+	}
+
+	plan := podmanCompactionPlan{
+		MachineName:               input.MachineName,
+		Provider:                  input.Provider,
+		DiskFormat:                diskFormat,
+		DiskPath:                  input.DiskPath,
+		TempPath:                  tempPath,
+		BackupPath:                backupPath,
+		ConfigEnabled:             input.ConfigEnabled,
+		QemuImgAvailable:          input.QemuImgAvailable,
+		ActiveContainers:          input.ActiveContainers,
+		ActiveContainerCheckError: input.ActiveContainerCheckError,
+		DiskPathExpected:          input.DiskPathExpected,
+		BackupExists:              input.BackupExists,
+		LogicalBytes:              input.LogicalBytes,
+		PhysicalBytes:             physicalBytes,
+		FreeBytes:                 input.FreeBytes,
+		RequiredFreeBytes:         requiredFreeBytes,
+		EstimatedReclaimBytes:     estimatedReclaimBytes,
+		Steps: []string{
+			fmt.Sprintf("Inspect Podman machine %q disk metadata", input.MachineName),
+			"Confirm no active containers are running",
+			fmt.Sprintf("Stop Podman machine %q", input.MachineName),
+			fmt.Sprintf("Convert %s to %s with qemu-img convert -f %s -O %s", input.DiskPath, tempPath, diskFormat, diskFormat),
+			"Verify the compacted image before replacing the original",
+			"Preserve the original disk image as rollback backup until restart succeeds",
+			fmt.Sprintf("Replace %s with compacted image", input.DiskPath),
+			fmt.Sprintf("Start Podman machine %q and verify it boots", input.MachineName),
+		},
+	}
+
+	if input.Provider == "applehv" {
+		plan.Warnings = append(plan.Warnings, "applehv/raw guest fstrim does not prove host APFS allocation was reclaimed")
+	}
+	if input.Config.CompactMinReclaimGB > 0 {
+		plan.Warnings = append(plan.Warnings,
+			fmt.Sprintf("offline compaction is skipped below %dGiB physical allocation", input.Config.CompactMinReclaimGB))
+	}
+
+	switch {
+	case !input.ConfigEnabled:
+		plan.SkipReason = "compact_disk_offline_disabled"
+	case input.MachineName == "":
+		plan.SkipReason = "machine_unknown"
+	case input.DiskPath == "":
+		plan.SkipReason = "disk_path_unavailable"
+	case !input.DiskPathExpected:
+		plan.SkipReason = "disk_path_outside_podman_machine_dirs"
+	case input.BackupExists:
+		plan.SkipReason = "backup_path_exists"
+	case !supportedProvider:
+		plan.SkipReason = "unsupported_provider"
+	case !providerAllowed(input.Provider, input.Config.CompactProviderAllowlist):
+		plan.SkipReason = "provider_not_allowlisted"
+	case input.ActiveContainerCheckError != "":
+		plan.SkipReason = "active_container_check_failed"
+	case input.Config.CompactRequireNoActiveContainers && input.ActiveContainers:
+		plan.SkipReason = "active_containers"
+	case !input.QemuImgAvailable:
+		plan.SkipReason = "qemu_img_missing"
+	case physicalBytes <= 0:
+		plan.SkipReason = "physical_size_unknown"
+	case minReclaimBytes > 0 && physicalBytes < minReclaimBytes:
+		plan.SkipReason = "below_minimum_physical_allocation"
+	case input.FreeBytes < requiredFreeBytes:
+		plan.SkipReason = "insufficient_free_space"
+	default:
+		plan.CanCompact = true
+	}
+
+	return plan
+}
+
+func podmanDiskFormat(provider string) (string, bool) {
+	switch provider {
+	case "applehv", "libkrun":
+		return "raw", true
+	case "qemu":
+		return "qcow2", true
+	default:
+		return "", false
+	}
+}
+
+func providerAllowed(provider string, allowlist []string) bool {
+	if len(allowlist) == 0 {
+		return true
+	}
+	for _, allowed := range allowlist {
+		if provider == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func podmanCompactionRequiredFreeBytes(physicalBytes int64) int64 {
+	if physicalBytes <= 0 {
+		return podmanCompactionGiB
+	}
+
+	headroom := physicalBytes / 10
+	if headroom < podmanCompactionGiB {
+		headroom = podmanCompactionGiB
+	}
+	return physicalBytes + headroom
+}
+
+func expectedPodmanMachineDiskPath(path string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+
+	roots := []string{
+		filepath.Join(home, ".local/share/containers/podman/machine"),
+		filepath.Join(home, ".config/containers/podman/machine"),
+	}
+	return pathWithinRoots(path, roots)
+}
+
+func pathWithinRoots(path string, roots []string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+
+	for _, root := range roots {
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(absRoot, absPath)
+		if err != nil {
+			continue
+		}
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (p *PodmanPlugin) hasActiveContainers(ctx context.Context) (bool, error) {
+	output, err := p.runPodmanCommand(ctx, "ps", "-q")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(output) != "", nil
+}
+
+func commandAvailable(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+func int64FromUint64(value uint64) int64 {
+	maxInt64 := uint64(^uint64(0) >> 1)
+	if value > maxInt64 {
+		return int64(maxInt64)
+	}
+	return int64(value)
+}
+
+func restorePodmanDiskBackup(diskPath, backupPath string) error {
+	if pathExists(diskPath) {
+		failedPath := diskPath + ".failed"
+		if err := os.Rename(diskPath, failedPath); err != nil {
+			return err
+		}
+	}
+	return os.Rename(backupPath, diskPath)
+}
+
 // compactRawDisk performs offline disk compaction for the Podman machine VM.
 // For raw disk images (applehv, libkrun): creates a sparse copy via qemu-img.
 // For qcow2 (qemu): converts to reclaim space.
 // ONLY runs at Critical level with explicit opt-in via config.
-func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) (int64, error) {
+func (p *PodmanPlugin) compactRawDisk(ctx context.Context, cfg *config.Config, logger *slog.Logger) (int64, error) {
 	if !p.environment.VMRunning || p.environment.MachineName == "" {
 		return 0, nil
 	}
 
-	// Check if qemu-img is available
-	if _, err := exec.LookPath("qemu-img"); err != nil {
-		return 0, fmt.Errorf("qemu-img not available: %w", err)
-	}
-
-	// Get raw disk file path from podman machine inspect
-	diskPath, err := p.getMachineDiskPath(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("cannot determine disk path: %w", err)
-	}
-	if diskPath == "" {
-		return 0, fmt.Errorf("empty disk path for machine %s", p.environment.MachineName)
-	}
-
-	// Get current size
-	stat, err := os.Stat(diskPath)
-	if err != nil {
-		return 0, fmt.Errorf("cannot stat disk: %w", err)
-	}
-	sizeBefore := stat.Size()
-
-	// Safety check: ensure enough free space for the temporary copy.
-	// qemu-img convert writes a full copy before we can remove the original,
-	// so we need at least the disk image size in free space.
-	diskDir := filepath.Dir(diskPath)
-	freeSpace, err := getFreeDiskSpace(diskDir)
-	if err != nil {
-		return 0, fmt.Errorf("cannot check free space: %w", err)
-	}
-	if freeSpace < uint64(sizeBefore) {
-		logger.Warn("skipping Podman disk compaction: insufficient free space",
-			"disk_size_gb", fmt.Sprintf("%.1f", float64(sizeBefore)/(1024*1024*1024)),
-			"free_gb", fmt.Sprintf("%.1f", float64(freeSpace)/(1024*1024*1024)))
+	plan := p.planOfflineCompaction(ctx, cfg, logger)
+	if !plan.CanCompact {
+		logger.Warn("skipping Podman disk compaction",
+			"machine", plan.MachineName,
+			"provider", plan.Provider,
+			"reason", plan.SkipReason)
 		return 0, nil
 	}
 
-	// Determine disk format based on provider
-	var diskFormat string
-	switch p.environment.VMProvider {
-	case "applehv", "libkrun":
-		diskFormat = "raw"
-	case "qemu":
-		diskFormat = "qcow2"
-	default:
-		return 0, fmt.Errorf("unsupported VM provider for compaction: %s", p.environment.VMProvider)
-	}
-
-	sparsePath := diskPath + ".sparse"
-
 	logger.Warn("CRITICAL: stopping Podman machine for disk compaction",
-		"machine", p.environment.MachineName, "format", diskFormat)
+		"machine", p.environment.MachineName,
+		"format", plan.DiskFormat,
+		"logical_gb", fmt.Sprintf("%.1f", float64(plan.LogicalBytes)/float64(podmanCompactionGiB)),
+		"physical_gb", fmt.Sprintf("%.1f", float64(plan.PhysicalBytes)/float64(podmanCompactionGiB)),
+		"required_free_gb", fmt.Sprintf("%.1f", float64(plan.RequiredFreeBytes)/float64(podmanCompactionGiB)))
 
 	// 1. Stop machine
 	stopCmd := exec.CommandContext(ctx, "podman", "machine", "stop", p.environment.MachineName)
@@ -557,9 +921,9 @@ func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) 
 	// 2. Convert to sparse copy
 	logger.Info("compacting Podman machine disk", "machine", p.environment.MachineName)
 	convertCmd := exec.CommandContext(ctx, "qemu-img", "convert",
-		"-f", diskFormat, "-O", diskFormat, diskPath, sparsePath)
+		"-f", plan.DiskFormat, "-O", plan.DiskFormat, plan.DiskPath, plan.TempPath)
 	if output, err := convertCmd.CombinedOutput(); err != nil {
-		os.Remove(sparsePath)
+		os.Remove(plan.TempPath)
 		// Restart machine before returning
 		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
 		p.environment.VMRunning = true
@@ -567,10 +931,10 @@ func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) 
 	}
 
 	// 3. Verify if qcow2 format
-	if diskFormat == "qcow2" {
-		checkCmd := exec.CommandContext(ctx, "qemu-img", "check", sparsePath)
+	if plan.DiskFormat == "qcow2" {
+		checkCmd := exec.CommandContext(ctx, "qemu-img", "check", plan.TempPath)
 		if output, err := checkCmd.CombinedOutput(); err != nil {
-			os.Remove(sparsePath)
+			os.Remove(plan.TempPath)
 			exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
 			p.environment.VMRunning = true
 			return 0, fmt.Errorf("qemu-img check failed: %w (output: %s)", err, string(output))
@@ -578,17 +942,41 @@ func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) 
 	}
 
 	// 4. Get compacted size
-	sparseStat, err := os.Stat(sparsePath)
+	sparseStat, err := os.Stat(plan.TempPath)
 	if err != nil {
-		os.Remove(sparsePath)
+		os.Remove(plan.TempPath)
 		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
 		p.environment.VMRunning = true
 		return 0, fmt.Errorf("cannot stat compacted disk: %w", err)
 	}
+	physicalAfter, err := getFileAllocatedBytes(plan.TempPath)
+	if err != nil {
+		os.Remove(plan.TempPath)
+		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+		p.environment.VMRunning = true
+		return 0, fmt.Errorf("cannot stat compacted disk allocation: %w", err)
+	}
 
 	// 5. Replace original
-	if err := os.Rename(sparsePath, diskPath); err != nil {
-		os.Remove(sparsePath)
+	if cfg.Podman.CompactKeepBackupUntilRestart {
+		if err := os.Rename(plan.DiskPath, plan.BackupPath); err != nil {
+			os.Remove(plan.TempPath)
+			exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+			p.environment.VMRunning = true
+			return 0, fmt.Errorf("failed to preserve original disk backup: %w", err)
+		}
+		if err := os.Rename(plan.TempPath, plan.DiskPath); err != nil {
+			restoreErr := os.Rename(plan.BackupPath, plan.DiskPath)
+			os.Remove(plan.TempPath)
+			exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+			p.environment.VMRunning = true
+			if restoreErr != nil {
+				return 0, fmt.Errorf("failed to replace disk and restore backup: replace=%w restore=%v", err, restoreErr)
+			}
+			return 0, fmt.Errorf("failed to replace disk: %w", err)
+		}
+	} else if err := os.Rename(plan.TempPath, plan.DiskPath); err != nil {
+		os.Remove(plan.TempPath)
 		exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
 		p.environment.VMRunning = true
 		return 0, fmt.Errorf("failed to replace disk: %w", err)
@@ -600,16 +988,32 @@ func (p *PodmanPlugin) compactRawDisk(ctx context.Context, logger *slog.Logger) 
 	if output, err := startCmd.CombinedOutput(); err != nil {
 		logger.Error("failed to restart machine after compaction",
 			"machine", p.environment.MachineName, "error", err, "output", string(output))
+		if cfg.Podman.CompactKeepBackupUntilRestart {
+			if restoreErr := restorePodmanDiskBackup(plan.DiskPath, plan.BackupPath); restoreErr != nil {
+				return 0, fmt.Errorf("failed to restart machine after compaction and restore backup: restart=%w restore=%v", err, restoreErr)
+			}
+			exec.CommandContext(ctx, "podman", "machine", "start", p.environment.MachineName).Run()
+		}
+		p.environment.VMRunning = true
+		return 0, fmt.Errorf("failed to restart machine after compaction: %w", err)
 	}
 	p.environment.VMRunning = true
 
-	freed := sizeBefore - sparseStat.Size()
+	if cfg.Podman.CompactKeepBackupUntilRestart {
+		if err := os.Remove(plan.BackupPath); err != nil {
+			return 0, fmt.Errorf("compacted disk verified but backup remains at %s: %w", plan.BackupPath, err)
+		}
+	}
+
+	freed := safeBytesDiff(plan.PhysicalBytes, physicalAfter)
 	if freed > 0 {
 		logger.Info("Podman disk compaction complete",
 			"machine", p.environment.MachineName,
-			"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1024*1024*1024)),
-			"before_gb", fmt.Sprintf("%.1f", float64(sizeBefore)/(1024*1024*1024)),
-			"after_gb", fmt.Sprintf("%.1f", float64(sparseStat.Size())/(1024*1024*1024)),
+			"freed_gb", fmt.Sprintf("%.1f", float64(freed)/float64(podmanCompactionGiB)),
+			"logical_before_gb", fmt.Sprintf("%.1f", float64(plan.LogicalBytes)/float64(podmanCompactionGiB)),
+			"physical_before_gb", fmt.Sprintf("%.1f", float64(plan.PhysicalBytes)/float64(podmanCompactionGiB)),
+			"logical_after_gb", fmt.Sprintf("%.1f", float64(sparseStat.Size())/float64(podmanCompactionGiB)),
+			"physical_after_gb", fmt.Sprintf("%.1f", float64(physicalAfter)/float64(podmanCompactionGiB)),
 		)
 		return freed, nil
 	}

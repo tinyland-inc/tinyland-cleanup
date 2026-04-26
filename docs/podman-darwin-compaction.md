@@ -1,0 +1,54 @@
+# Podman Darwin Compaction
+
+Podman on macOS runs Linux containers inside a VM. With the `applehv` provider,
+the VM disk is a raw sparse file on APFS. Guest `fstrim` can report large
+trimmed byte counts inside the VM, but that does not prove the host raw image
+released APFS allocation. The daemon therefore does not count `applehv` guest
+`fstrim` output as host bytes freed.
+
+## Review
+
+Use dry-run JSON before enabling offline compaction:
+
+```sh
+tinyland-cleanup --once --dry-run --level critical --output json
+```
+
+The Podman plan reports:
+
+- provider and running state;
+- disk format and disk path;
+- logical image size and physical host allocation;
+- required temporary free space based on physical allocation plus headroom;
+- active-container status;
+- whether `qemu-img` is available;
+- the exact stop, convert, verify, replace, and start sequence.
+
+## Enable
+
+Offline compaction is opt-in because it stops the Podman machine:
+
+```yaml
+podman:
+  compact_disk_offline: true
+  compact_min_reclaim_gb: 8
+  compact_require_no_active_containers: true
+  compact_keep_backup_until_restart: true
+  compact_provider_allowlist:
+    - applehv
+    - libkrun
+    - qemu
+```
+
+The preflight skips compaction when the disk path is outside expected Podman
+machine directories, `qemu-img` is unavailable, active containers are running,
+the provider is unknown, a rollback backup already exists, or the filesystem
+does not have enough physical free space for the compacted copy.
+
+## Rollback Boundary
+
+When `compact_keep_backup_until_restart` is enabled, the daemon preserves the
+original disk image as a `.backup` file until the compacted image starts
+successfully. If restart fails, it restores the original disk and attempts to
+start the machine again. Host bytes freed are reported from physical allocation
+before and after compaction, not from the raw image's logical size.
