@@ -4,5 +4,6 @@ result-*
 
 .DS_Store
 bazel-*
+MODULE.bazel.lock
 coverage.out
 dist/

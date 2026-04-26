@@ -256,6 +256,10 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 		}
 
 		if d.dryRun {
+			if planner, ok := p.(plugins.Planner); ok {
+				plan := planner.PlanCleanup(ctx, pluginLevel, d.config, d.logger)
+				pluginReport.Plan = &plan
+			}
 			pluginReport.SkipReason = "dry_run"
 			d.logger.Info("dry-run plugin plan",
 				"plugin", p.Name(),
@@ -350,18 +354,19 @@ type mountReport struct {
 }
 
 type pluginCycleReport struct {
-	Name                string `json:"name"`
-	Description         string `json:"description"`
-	Level               string `json:"level"`
-	DryRun              bool   `json:"dry_run"`
-	WouldRun            bool   `json:"would_run"`
-	SkipReason          string `json:"skip_reason,omitempty"`
-	BytesFreed          int64  `json:"bytes_freed"`
-	EstimatedBytesFreed int64  `json:"estimated_bytes_freed"`
-	CommandBytesFreed   int64  `json:"command_bytes_freed"`
-	HostBytesFreed      int64  `json:"host_bytes_freed"`
-	ItemsCleaned        int    `json:"items_cleaned"`
-	Error               string `json:"error,omitempty"`
+	Name                string               `json:"name"`
+	Description         string               `json:"description"`
+	Level               string               `json:"level"`
+	DryRun              bool                 `json:"dry_run"`
+	WouldRun            bool                 `json:"would_run"`
+	SkipReason          string               `json:"skip_reason,omitempty"`
+	Plan                *plugins.CleanupPlan `json:"plan,omitempty"`
+	BytesFreed          int64                `json:"bytes_freed"`
+	EstimatedBytesFreed int64                `json:"estimated_bytes_freed"`
+	CommandBytesFreed   int64                `json:"command_bytes_freed"`
+	HostBytesFreed      int64                `json:"host_bytes_freed"`
+	ItemsCleaned        int                  `json:"items_cleaned"`
+	Error               string               `json:"error,omitempty"`
 }
 
 type mountAssessment struct {

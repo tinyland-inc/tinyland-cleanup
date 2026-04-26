@@ -14,16 +14,34 @@ gazelle(name = "gazelle")
 
 go_binary(
     name = "tinyland-cleanup",
-    srcs = ["main.go"] + select({
-        "@platforms//os:macos": ["plugins_darwin.go"],
-        "//conditions:default": ["plugins_other.go"],
-    }),
+    embed = [":tinyland-cleanup_lib"],
     visibility = ["//visibility:public"],
     x_defs = {
         "main.commit": "{STABLE_GIT_COMMIT}",
         "main.date": "{BUILD_TIMESTAMP}",
         "main.version": "0.2.0",
     },
+)
+
+go_library(
+    name = "tinyland-cleanup_lib",
+    srcs = ["main.go"] + select({
+        "@platforms//os:macos": ["plugins_darwin.go"],
+        "//conditions:default": ["plugins_other.go"],
+    }),
+    importpath = "github.com/Jesssullivan/tinyland-cleanup",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":config",
+        ":monitor",
+        ":plugins",
+    ],
+)
+
+go_test(
+    name = "tinyland-cleanup_test",
+    srcs = ["main_test.go"],
+    embed = [":tinyland-cleanup_lib"],
     deps = [
         ":config",
         ":monitor",
@@ -103,6 +121,7 @@ go_test(
     name = "plugins_test",
     srcs = [
         "plugins/devartifacts_test.go",
+        "plugins/podman_compaction_test.go",
         "plugins/plugin_pbt_test.go",
         "plugins/plugin_test.go",
         "plugins/sudo_test.go",
@@ -122,6 +141,7 @@ test_suite(
     tests = [
         ":config_test",
         ":monitor_test",
+        ":tinyland-cleanup_test",
         ":plugins_test",
     ],
 )

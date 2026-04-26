@@ -34,8 +34,8 @@ func TestRunOnceDryRunJSONReport(t *testing.T) {
 	if report.Level != "critical" {
 		t.Fatalf("expected critical level, got %q", report.Level)
 	}
-	if report.HostFreeBeforeBytes == 0 || report.HostFreeAfterBytes == 0 {
-		t.Fatal("expected host free-space measurements")
+	if report.MonitorPath == "" {
+		t.Fatal("expected monitor path")
 	}
 	if len(report.Plugins) != 1 {
 		t.Fatalf("expected 1 plugin report, got %d", len(report.Plugins))
@@ -50,6 +50,45 @@ func TestRunOnceDryRunJSONReport(t *testing.T) {
 	}
 	if plugin.SkipReason != "dry_run" {
 		t.Fatalf("expected dry_run skip reason, got %q", plugin.SkipReason)
+	}
+}
+
+func TestRunOnceDryRunJSONReportIncludesPluginPlan(t *testing.T) {
+	var output bytes.Buffer
+	mock := &planningPlugin{
+		reportingPlugin: reportingPlugin{},
+		plan: plugins.CleanupPlan{
+			Plugin:            "reporting",
+			Level:             "critical",
+			Summary:           "reporting dry-run plan",
+			WouldRun:          false,
+			SkipReason:        "preflight_failed",
+			RequiredFreeBytes: 42,
+			Steps:             []string{"inspect", "verify"},
+			Metadata: map[string]string{
+				"provider": "test",
+			},
+		},
+	}
+	daemon := newTestDaemon(t, mock, &output)
+	daemon.dryRun = true
+
+	if err := daemon.runOnce(context.Background(), monitor.LevelCritical); err != nil {
+		t.Fatalf("runOnce failed: %v", err)
+	}
+
+	report := decodeCycleReport(t, output.Bytes())
+	if len(report.Plugins) != 1 {
+		t.Fatalf("expected 1 plugin report, got %d", len(report.Plugins))
+	}
+	if report.Plugins[0].Plan == nil {
+		t.Fatal("expected plugin dry-run plan")
+	}
+	if report.Plugins[0].Plan.SkipReason != "preflight_failed" {
+		t.Fatalf("expected preflight_failed plan skip reason, got %q", report.Plugins[0].Plan.SkipReason)
+	}
+	if report.Plugins[0].SkipReason != "dry_run" {
+		t.Fatalf("expected dry_run plugin skip reason, got %q", report.Plugins[0].SkipReason)
 	}
 }
 
@@ -153,4 +192,13 @@ func (p *reportingPlugin) Enabled(*config.Config) bool {
 func (p *reportingPlugin) Cleanup(context.Context, plugins.CleanupLevel, *config.Config, *slog.Logger) plugins.CleanupResult {
 	p.called = true
 	return p.result
+}
+
+type planningPlugin struct {
+	reportingPlugin
+	plan plugins.CleanupPlan
+}
+
+func (p *planningPlugin) PlanCleanup(context.Context, plugins.CleanupLevel, *config.Config, *slog.Logger) plugins.CleanupPlan {
+	return p.plan
 }

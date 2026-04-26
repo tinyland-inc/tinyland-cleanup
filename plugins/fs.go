@@ -148,6 +148,22 @@ func getFreeDiskSpace(path string) (uint64, error) {
 	return stat.Bavail * uint64(stat.Bsize), nil
 }
 
+// getFileAllocatedBytes returns physical blocks allocated on disk for a file.
+// It falls back to apparent size if the filesystem does not report blocks.
+func getFileAllocatedBytes(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Blocks <= 0 {
+		return info.Size(), nil
+	}
+
+	return stat.Blocks * 512, nil
+}
+
 // safeBytesDiff returns the difference between two sizes, floored at 0.
 // Prevents negative BytesFreed when files are added during cleanup.
 func safeBytesDiff(before, after int64) int64 {

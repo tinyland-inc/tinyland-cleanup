@@ -47,6 +47,11 @@ usable space. Plugin byte counts are supporting evidence and may differ from
 physical host reclaim, especially for sparse VM disks, container stores, and
 filesystem snapshots.
 
+For macOS Podman VM disk compaction, review
+[podman-darwin-compaction.md](podman-darwin-compaction.md). Guest `fstrim` on
+`applehv` raw images is advisory and is not counted as host-side reclaimed
+space.
+
 ## Current Boundary
 
 This is the first stable reporting surface. It does not yet expose per-file
