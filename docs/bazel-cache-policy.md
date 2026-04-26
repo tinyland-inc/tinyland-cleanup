@@ -34,6 +34,10 @@ Default policy:
 bazel:
   roots:
     - ~/.cache/bazel
+  workspace_roots:
+    - ~/git
+    - ~/src
+    - ~/projects
   bazelisk_cache: ~/Library/Caches/bazelisk
   max_total_gb: 20
   keep_recent_output_bases: 5
@@ -59,10 +63,13 @@ Runtime boundary:
 - cache-tier cleanup is skipped while active Bazel or Bazelisk work is visible;
 - deletion normalizes writable permissions first, and on Darwin attempts to
   clear `uchg` file flags with `chflags -R nouchg`;
+- after an output base is deleted, workspace roots are scanned shallowly for
+  canonical repo-local `bazel-*` symlinks, and only symlinks whose raw target
+  points inside that deleted output base are removed;
 - byte counts use top-level allocation estimates so dry-run remains responsive
   on very large generated trees;
-- repo-local `bazel-*` symlink cleanup remains a follow-up after output-base
-  deletion evidence is proven on real hosts.
+- idle Bazel server stop remains a follow-up guarded by
+  `allow_stop_idle_servers`.
 
 Do not disable active-output-base protection on developer machines or shared
 runners unless an operator has already drained the relevant jobs and accepted

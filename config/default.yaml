@@ -95,6 +95,10 @@ nix:
 bazel:
   roots:
     - ~/.cache/bazel
+  workspace_roots:
+    - ~/git
+    - ~/src
+    - ~/projects
   # Darwin default; Linux operators commonly use ~/.cache/bazelisk
   bazelisk_cache: ~/Library/Caches/bazelisk
   max_total_gb: 20

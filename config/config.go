@@ -186,6 +186,8 @@ type PodmanConfig struct {
 type BazelConfig struct {
 	// Roots are directories that may contain Bazel output-user-root trees or caches.
 	Roots []string `yaml:"roots"`
+	// WorkspaceRoots are developer workspace roots scanned for repo-local bazel-* symlinks after output-base deletion.
+	WorkspaceRoots []string `yaml:"workspace_roots"`
 	// BazeliskCache is the Bazelisk download cache path.
 	BazeliskCache string `yaml:"bazelisk_cache"`
 	// MaxTotalGB is the review budget across detected Bazel caches.
@@ -377,6 +379,7 @@ func DefaultConfig() *Config {
 		},
 		Bazel: BazelConfig{
 			Roots:                 defaultBazelRoots(home),
+			WorkspaceRoots:        defaultScanPaths,
 			BazeliskCache:         bazeliskCache,
 			MaxTotalGB:            20,
 			KeepRecentOutputBases: 5,
