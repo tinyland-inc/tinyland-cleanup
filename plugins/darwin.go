@@ -448,7 +448,7 @@ func (p *CachePlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *
 		Steps: []string{
 			"Measure known Darwin developer caches by physical allocation",
 			"Classify versioned tool caches by cache family and active-use evidence",
-			"Protect settings, application support data, project workspaces, credentials, and active IDE versions",
+			"Protect settings, extension data, application support data, project workspaces, credentials, and active editor or IDE versions",
 		},
 		Metadata: map[string]string{
 			"darwin_dev_caches_enabled": strconv.FormatBool(cfg.DarwinDevCaches.Enabled),
@@ -722,7 +722,85 @@ func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.Darwin
 		}
 	}
 
+	if cfg.VSCode.Enabled {
+		targets = append(targets, p.darwinEditorCacheTargets(home, cfg.VSCode, activeProcesses, level, enforce, "vscode-cache", "VS Code", "Code", []string{
+			"visual studio code",
+			"code helper",
+		})...)
+	}
+
+	if cfg.Cursor.Enabled {
+		targets = append(targets, p.darwinEditorCacheTargets(home, cfg.Cursor, activeProcesses, level, enforce, "cursor-cache", "Cursor", "Cursor", []string{
+			"cursor",
+			"cursor helper",
+		})...)
+	}
+
 	return targets
+}
+
+func (p *CachePlugin) darwinEditorCacheTargets(home string, cfg config.DarwinDevCacheToolConfig, activeProcesses map[string]bool, level CleanupLevel, enforce bool, targetType, displayName, appSupportName string, processNames []string) []CleanupTarget {
+	active := cfg.KeepActiveVersions && darwinAnyProcessActive(activeProcesses, processNames...)
+	targetPaths := darwinEditorCachePaths(home, appSupportName)
+	targets := make([]CleanupTarget, 0, len(targetPaths))
+
+	for _, path := range targetPaths {
+		if !pathExistsAndIsDir(path) {
+			continue
+		}
+		stale := dirModTimeStale(path, cfg.StaleAfterDays)
+		eligible := !active && (level >= LevelCritical || (level >= LevelModerate && stale))
+		name := darwinEditorCacheTargetName(home, path)
+		targets = append(targets, CleanupTarget{
+			Type:      targetType,
+			Name:      name,
+			Path:      path,
+			Bytes:     getDirAllocatedBytes(path),
+			Active:    active,
+			Protected: darwinCacheProtected(active, enforce, eligible),
+			Action:    darwinCacheAction(active, enforce, eligible),
+			Reason: darwinCacheReason(active, enforce, eligible,
+				displayName+" cache directory",
+				fmt.Sprintf("stale-after policy is %d days; critical pressure can delete inactive editor cache directories", cfg.StaleAfterDays)),
+		})
+	}
+
+	return targets
+}
+
+func darwinEditorCachePaths(home string, appSupportName string) []string {
+	appSupportRoot := filepath.Join(home, "Library", "Application Support", appSupportName)
+	paths := []string{
+		filepath.Join(appSupportRoot, "Cache"),
+		filepath.Join(appSupportRoot, "CachedData"),
+		filepath.Join(appSupportRoot, "Code Cache"),
+		filepath.Join(appSupportRoot, "DawnCache"),
+		filepath.Join(appSupportRoot, "GPUCache"),
+		filepath.Join(appSupportRoot, "ShaderCache"),
+		filepath.Join(appSupportRoot, "Service Worker", "CacheStorage"),
+		filepath.Join(home, "Library", "Caches", appSupportName),
+	}
+
+	switch appSupportName {
+	case "Code":
+		paths = append(paths, filepath.Join(home, "Library", "Caches", "com.microsoft.VSCode"))
+	case "Cursor":
+		paths = append(paths, filepath.Join(home, "Library", "Caches", "com.cursor.Cursor"))
+	}
+
+	return paths
+}
+
+func darwinEditorCacheTargetName(home string, path string) string {
+	for _, root := range []string{
+		filepath.Join(home, "Library", "Application Support"),
+		filepath.Join(home, "Library", "Caches"),
+	} {
+		if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return rel
+		}
+	}
+	return filepath.Base(path)
 }
 
 func (p *CachePlugin) cleanupDarwinDeveloperCacheTargets(ctx context.Context, level CleanupLevel, home string, cfg config.DarwinDevCachesConfig, logger *slog.Logger) CleanupResult {
