@@ -20,6 +20,13 @@ Use JSON when another tool needs the stable report schema:
 tinyland-cleanup --once --dry-run --level critical --output json
 ```
 
+For a one-off operator run, override the configured maximum used-space target
+without editing config:
+
+```sh
+tinyland-cleanup --once --dry-run --level critical --target-used-percent 82
+```
+
 The JSON report includes:
 
 - the selected cleanup level;

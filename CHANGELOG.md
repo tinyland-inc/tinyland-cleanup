@@ -40,6 +40,8 @@ All notable changes to this project will be documented in this file.
 - Human-readable `--output text` reports now explain dry-run and cleanup cycles
   with mount status, host free-space accounting, plugin plans, warnings, and
   representative targets.
+- CLI `--target-used-percent` override for one-off cleanup runs without editing
+  config.
 
 ### Changed
 

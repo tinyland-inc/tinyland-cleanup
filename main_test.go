@@ -269,6 +269,31 @@ func TestRunOnceStopsAfterTargetFreeMet(t *testing.T) {
 	}
 }
 
+func TestApplyTargetUsedPercentOverride(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.TargetFree = 70
+
+	if err := applyTargetUsedPercentOverride(cfg, 82); err != nil {
+		t.Fatalf("override failed: %v", err)
+	}
+	if cfg.TargetFree != 82 {
+		t.Fatalf("expected target used percent 82, got %d", cfg.TargetFree)
+	}
+
+	if err := applyTargetUsedPercentOverride(cfg, 0); err != nil {
+		t.Fatalf("zero override should be ignored: %v", err)
+	}
+	if cfg.TargetFree != 82 {
+		t.Fatalf("zero override should preserve existing target, got %d", cfg.TargetFree)
+	}
+
+	for _, value := range []int{-1, 100} {
+		if err := applyTargetUsedPercentOverride(cfg, value); err == nil {
+			t.Fatalf("expected error for target override %d", value)
+		}
+	}
+}
+
 func TestRunOnceSkipsPluginDuringCooldown(t *testing.T) {
 	var output bytes.Buffer
 	mock := &reportingPlugin{}

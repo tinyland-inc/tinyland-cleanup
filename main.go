@@ -16,6 +16,8 @@
 //	-level string     Force cleanup level: none, warning, moderate, aggressive, critical
 //	-dry-run          Show what would be cleaned without actually cleaning
 //	-output string    Output format: text, json (default: text)
+//	-target-used-percent int
+//	                 Override target maximum used-space percentage after cleanup
 //	-verbose          Enable verbose logging
 //	-version          Print version and exit
 package main
@@ -54,6 +56,7 @@ func main() {
 		level       = flag.String("level", "", "Force cleanup level")
 		dryRun      = flag.Bool("dry-run", false, "Show what would be cleaned")
 		output      = flag.String("output", "text", "Output format: text, json")
+		targetUsed  = flag.Int("target-used-percent", 0, "Override target maximum used-space percentage after cleanup")
 		verbose     = flag.Bool("verbose", false, "Enable verbose logging")
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
@@ -80,6 +83,10 @@ func main() {
 		// Fall back to stderr logging if config fails
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
+	}
+	if err := applyTargetUsedPercentOverride(cfg, *targetUsed); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
 	}
 
 	// Setup log file directory
@@ -663,6 +670,17 @@ func targetFreeBytes(totalBytes uint64, targetUsedPercent int) (uint64, bool) {
 
 	freePercent := 100 - targetUsedPercent
 	return totalBytes * uint64(freePercent) / 100, true
+}
+
+func applyTargetUsedPercentOverride(cfg *config.Config, targetUsedPercent int) error {
+	if targetUsedPercent == 0 {
+		return nil
+	}
+	if targetUsedPercent <= 0 || targetUsedPercent >= 100 {
+		return fmt.Errorf("invalid target-used-percent %d: expected 1-99", targetUsedPercent)
+	}
+	cfg.TargetFree = targetUsedPercent
+	return nil
 }
 
 func expandPathHome(path string) string {
