@@ -33,12 +33,17 @@ All notable changes to this project will be documented in this file.
 - Structured dry-run targets for development artifacts such as stale
   `node_modules`, Python virtualenvs, Rust `target/` directories, Go build
   cache, Haskell caches, and opt-in LM Studio model caches.
+- Opt-in Darwin developer-cache enforcement for typed JetBrains, Playwright,
+  Bazelisk, and pip cache targets.
 
 ### Changed
 
 - Go module path moved to `github.com/Jesssullivan/tinyland-cleanup`.
 - Clarified that the legacy `target_free` config key represents the target
   maximum used-space percentage after cleanup.
+- Critical Darwin cache cleanup now prefers typed developer-cache targets when
+  `darwin_dev_caches.enabled` is true, avoiding broad `~/Library/Caches`
+  sweeps unless the typed policy is disabled.
 
 ## [0.2.0]
 

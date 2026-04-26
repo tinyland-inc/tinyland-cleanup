@@ -76,7 +76,7 @@ space.
 
 For Darwin IDE and tool caches, review
 [darwin-dev-caches.md](darwin-dev-caches.md). These targets are reported for
-operator review before budget enforcement is enabled.
+operator review, and real deletion requires `darwin_dev_caches.enforce: true`.
 
 For workspace build artifacts, the `dev-artifacts` plan reports rebuildable
 targets such as `node_modules`, Python virtualenvs, Rust `target/` directories,

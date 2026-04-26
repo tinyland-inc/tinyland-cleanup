@@ -29,6 +29,17 @@ Safety boundaries:
 - protect newest Playwright browser revisions per browser family;
 - protect the newest Bazelisk cache entries.
 
-This surface is currently a review and classification layer. Budget enforcement
-for these typed targets should remain a separate opt-in policy pass after the
-dry-run evidence is proven on real Darwin developer machines.
+Real deletion for these typed targets is opt-in. Leave enforcement disabled
+until a dry-run has been reviewed:
+
+```yaml
+darwin_dev_caches:
+  enabled: true
+  enforce: false
+```
+
+When `enforce: true`, moderate cleanup can delete unprotected Playwright and
+Bazelisk entries outside the keep-latest policy and stale pip caches. Aggressive
+cleanup can delete inactive stale JetBrains cache versions. Critical cleanup can
+delete inactive unprotected JetBrains cache versions regardless of age. The same
+protected target rules from dry-run planning are used for real cleanup.
