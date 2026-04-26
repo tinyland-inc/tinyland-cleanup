@@ -269,6 +269,9 @@ func TestNixPolicyDefaults(t *testing.T) {
 	if cfg.Nix.MaxGCDuration != "20m" {
 		t.Errorf("Nix.MaxGCDuration should be 20m, got %q", cfg.Nix.MaxGCDuration)
 	}
+	if cfg.Nix.RootAttributionLimit != 20 {
+		t.Errorf("Nix.RootAttributionLimit should be 20, got %d", cfg.Nix.RootAttributionLimit)
+	}
 }
 
 func TestBazelPolicyDefaults(t *testing.T) {
@@ -377,6 +380,7 @@ nix:
   skip_when_daemon_busy: false
   daemon_busy_backoff: 45m
   max_gc_duration: 10m
+  root_attribution_limit: 8
 bazel:
   roots:
     - ~/custom-bazel
@@ -488,6 +492,9 @@ darwin_dev_caches:
 	}
 	if cfg.Nix.MaxGCDuration != "10m" {
 		t.Errorf("Nix.MaxGCDuration should be 10m per config, got %q", cfg.Nix.MaxGCDuration)
+	}
+	if cfg.Nix.RootAttributionLimit != 8 {
+		t.Errorf("Nix.RootAttributionLimit should be 8 per config, got %d", cfg.Nix.RootAttributionLimit)
 	}
 	if len(cfg.Bazel.Roots) != 1 || cfg.Bazel.Roots[0] != "~/custom-bazel" {
 		t.Errorf("unexpected Bazel.Roots: %#v", cfg.Bazel.Roots)

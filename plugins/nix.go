@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -25,6 +26,13 @@ type nixGeneration struct {
 	Current   bool
 	Scope     string
 	Profile   string
+}
+
+type nixGCRoot struct {
+	Root      string
+	StorePath string
+	Class     string
+	Active    bool
 }
 
 // NewNixPlugin creates a new Nix cleanup plugin.
@@ -70,6 +78,7 @@ func (p *NixPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *co
 			"skip_when_daemon_busy":                     strconv.FormatBool(cfg.Nix.SkipWhenDaemonBusy),
 			"daemon_busy_backoff":                       cfg.Nix.DaemonBusyBackoff,
 			"max_gc_duration":                           cfg.Nix.MaxGCDuration,
+			"root_attribution_limit":                    strconv.Itoa(nixRootAttributionLimit(cfg.Nix)),
 			"generation_policy_delete_older_than_level": nixGenerationPolicyAge(level, cfg.Nix),
 		},
 	}
@@ -108,6 +117,12 @@ func (p *NixPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *co
 		plan.Metadata["dry_run_store_paths"] = strconv.Itoa(paths)
 		if estimated == 0 {
 			plan.Warnings = append(plan.Warnings, "Nix dry-run reported no reclaimable store space; live roots may be retaining the store")
+			targets, metadata, warnings := p.planGCRootAttribution(ctx, cfg.Nix)
+			plan.Targets = append(plan.Targets, targets...)
+			for key, value := range metadata {
+				plan.Metadata[key] = value
+			}
+			plan.Warnings = append(plan.Warnings, warnings...)
 		}
 	}
 
@@ -188,6 +203,50 @@ func (p *NixPlugin) collectGarbageDryRun(ctx context.Context, cfg config.NixConf
 	cmd := exec.CommandContext(ctx, "nix-collect-garbage", "--dry-run")
 	output, err := cmd.CombinedOutput()
 	return string(output), err
+}
+
+func (p *NixPlugin) printGCRoots(ctx context.Context, cfg config.NixConfig) (string, error) {
+	if _, err := exec.LookPath("nix-store"); err != nil {
+		return "", err
+	}
+
+	timeout := nixCommandTimeout(cfg)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "nix-store", "--gc", "--print-roots")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("nix-store --gc --print-roots failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return string(output), nil
+}
+
+func (p *NixPlugin) planGCRootAttribution(ctx context.Context, cfg config.NixConfig) ([]CleanupTarget, map[string]string, []string) {
+	limit := nixRootAttributionLimit(cfg)
+	if limit == 0 {
+		return nil, map[string]string{"gc_root_attribution": "disabled"}, nil
+	}
+
+	metadata := map[string]string{
+		"gc_root_attribution_limit": strconv.Itoa(limit),
+	}
+	output, err := p.printGCRoots(ctx, cfg)
+	if err != nil {
+		return nil, metadata, []string{fmt.Sprintf("could not inspect Nix GC roots: %v", err)}
+	}
+
+	roots := parseNixGCRoots(output)
+	metadata["gc_root_attribution_roots"] = strconv.Itoa(len(roots))
+	metadata["gc_root_attribution_classes"] = nixGCRootClassSummary(roots)
+
+	targets := nixGCRootTargets(roots, limit)
+	if len(targets) < len(roots) {
+		metadata["gc_root_attribution_truncated"] = "true"
+		return targets, metadata, []string{fmt.Sprintf("Nix GC root attribution truncated to %d of %d visible roots", len(targets), len(roots))}
+	}
+
+	return targets, metadata, nil
 }
 
 func (p *NixPlugin) collectGarbage(ctx context.Context, level CleanupLevel, args []string, cfg config.NixConfig, logger *slog.Logger) CleanupResult {
@@ -413,6 +472,13 @@ func nixCommandTimeout(cfg config.NixConfig) time.Duration {
 	return parseNixPolicyDuration(cfg.MaxGCDuration, nixDefaultCommandTimeout)
 }
 
+func nixRootAttributionLimit(cfg config.NixConfig) int {
+	if cfg.RootAttributionLimit < 0 {
+		return 0
+	}
+	return cfg.RootAttributionLimit
+}
+
 func parseNixPolicyDuration(raw string, fallback time.Duration) time.Duration {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -479,6 +545,138 @@ func parseNixGenerations(output, scope, profile string) ([]nixGeneration, error)
 	}
 
 	return generations, nil
+}
+
+func parseNixGCRoots(output string) []nixGCRoot {
+	var roots []nixGCRoot
+	seen := map[string]bool{}
+
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		root := line
+		storePath := ""
+		if before, after, ok := strings.Cut(line, " -> "); ok {
+			root = strings.TrimSpace(before)
+			storePath = strings.TrimSpace(after)
+		} else {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				root = fields[0]
+				storePath = fields[len(fields)-1]
+			}
+		}
+		if root == "" {
+			continue
+		}
+
+		key := root + "\x00" + storePath
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		class, active := classifyNixGCRoot(root)
+		roots = append(roots, nixGCRoot{
+			Root:      root,
+			StorePath: storePath,
+			Class:     class,
+			Active:    active,
+		})
+	}
+
+	sort.Slice(roots, func(i, j int) bool {
+		if roots[i].Class == roots[j].Class {
+			return roots[i].Root < roots[j].Root
+		}
+		return roots[i].Class < roots[j].Class
+	})
+	return roots
+}
+
+func classifyNixGCRoot(root string) (string, bool) {
+	lower := strings.ToLower(root)
+
+	switch {
+	case strings.HasPrefix(root, "/proc/"):
+		return "process_root", true
+	case strings.Contains(lower, "/profiles/per-user/") ||
+		strings.Contains(lower, "/nix/var/nix/profiles") ||
+		strings.Contains(lower, "/.local/state/nix/profiles") ||
+		strings.Contains(lower, "/.nix-profile"):
+		return "profile_root", false
+	case strings.Contains(lower, "/gcroots/auto/"):
+		return "auto_gcroot", false
+	case strings.Contains(lower, "/gcroots/"):
+		return "gcroot", false
+	case strings.HasSuffix(root, "/result") ||
+		strings.Contains(root, "/result-"):
+		return "workspace_result", false
+	case strings.Contains(lower, "/var/folders/") ||
+		strings.Contains(lower, "/tmp/"):
+		return "temporary_root", false
+	default:
+		return "unknown_root", false
+	}
+}
+
+func nixGCRootTargets(roots []nixGCRoot, limit int) []CleanupTarget {
+	if limit <= 0 || len(roots) == 0 {
+		return nil
+	}
+
+	if limit > len(roots) {
+		limit = len(roots)
+	}
+
+	targets := make([]CleanupTarget, 0, limit)
+	for _, root := range roots[:limit] {
+		reason := "visible Nix GC root retaining store path"
+		if root.StorePath != "" {
+			reason = fmt.Sprintf("%s %s", reason, filepath.Base(root.StorePath))
+		}
+		name := fmt.Sprintf("%s %s", root.Class, filepath.Base(root.Root))
+		if root.Active {
+			reason = "active process root; review the owning process before any Nix GC action"
+		}
+
+		targets = append(targets, CleanupTarget{
+			Type:      "nix_gc_root",
+			Name:      name,
+			Path:      root.Root,
+			Active:    root.Active,
+			Protected: true,
+			Action:    "review_gc_root",
+			Reason:    reason,
+		})
+	}
+	return targets
+}
+
+func nixGCRootClassSummary(roots []nixGCRoot) string {
+	if len(roots) == 0 {
+		return ""
+	}
+
+	counts := map[string]int{}
+	for _, root := range roots {
+		counts[root.Class]++
+	}
+
+	classes := make([]string, 0, len(counts))
+	for class := range counts {
+		classes = append(classes, class)
+	}
+	sort.Strings(classes)
+
+	parts := make([]string, 0, len(classes))
+	for _, class := range classes {
+		parts = append(parts, fmt.Sprintf("%s=%d", class, counts[class]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func nixGenerationTargets(generations []nixGeneration, now time.Time, minKeep int, olderThan time.Duration) []CleanupTarget {

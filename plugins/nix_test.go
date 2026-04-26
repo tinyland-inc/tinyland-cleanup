@@ -105,6 +105,73 @@ func TestParseNixGenerations(t *testing.T) {
 	}
 }
 
+func TestParseNixGCRoots(t *testing.T) {
+	output := `
+/proc/1234/fd/5 -> /nix/store/111-source
+/nix/var/nix/profiles/per-user/jess/profile-42-link -> /nix/store/222-home-manager-generation
+/nix/var/nix/gcroots/auto/abc -> /nix/store/333-tool
+/Users/jess/git/kernel/result -> /nix/store/444-linux-kernel
+/proc/1234/fd/5 -> /nix/store/111-source
+`
+
+	roots := parseNixGCRoots(output)
+	if len(roots) != 4 {
+		t.Fatalf("got %d roots, want 4: %#v", len(roots), roots)
+	}
+
+	classes := map[string]int{}
+	active := 0
+	for _, root := range roots {
+		classes[root.Class]++
+		if root.Active {
+			active++
+		}
+	}
+
+	if classes["process_root"] != 1 {
+		t.Fatalf("expected one process root, classes=%v", classes)
+	}
+	if classes["profile_root"] != 1 {
+		t.Fatalf("expected one profile root, classes=%v", classes)
+	}
+	if classes["auto_gcroot"] != 1 {
+		t.Fatalf("expected one auto gcroot, classes=%v", classes)
+	}
+	if classes["workspace_result"] != 1 {
+		t.Fatalf("expected one workspace result root, classes=%v", classes)
+	}
+	if active != 1 {
+		t.Fatalf("expected one active root, got %d", active)
+	}
+}
+
+func TestNixGCRootTargetsAreProtectedAndLimited(t *testing.T) {
+	roots := []nixGCRoot{
+		{
+			Root:      "/proc/1234/fd/5",
+			StorePath: "/nix/store/111-source",
+			Class:     "process_root",
+			Active:    true,
+		},
+		{
+			Root:      "/Users/jess/git/kernel/result",
+			StorePath: "/nix/store/444-linux-kernel",
+			Class:     "workspace_result",
+		},
+	}
+
+	targets := nixGCRootTargets(roots, 1)
+	if len(targets) != 1 {
+		t.Fatalf("got %d targets, want 1", len(targets))
+	}
+	if targets[0].Action != "review_gc_root" || !targets[0].Protected {
+		t.Fatalf("GC root target should be protected review-only: %+v", targets[0])
+	}
+	if !targets[0].Active {
+		t.Fatalf("process GC root should be marked active: %+v", targets[0])
+	}
+}
+
 func TestNixGenerationTargetsPreserveCurrentAndMinimum(t *testing.T) {
 	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
 	generations := []nixGeneration{

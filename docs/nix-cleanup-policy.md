@@ -15,6 +15,7 @@ The Nix plan includes:
 - `estimated_bytes_freed` from `nix-collect-garbage --dry-run`;
 - detected active Nix work such as `nix build`, `home-manager switch`,
   `darwin-rebuild`, `nixos-rebuild`, and worker-style `nix-daemon` activity;
+- visible GC roots when dry-run GC reports no reclaimable store space;
 - generation targets with `keep_generation`, `delete_generation`, or
   `review_privileged_generation` actions;
 - configured minimum user and system generation retention;
@@ -32,6 +33,7 @@ nix:
   skip_when_daemon_busy: true
   daemon_busy_backoff: 30m
   max_gc_duration: 20m
+  root_attribution_limit: 20
 ```
 
 Runtime behavior:
@@ -42,6 +44,10 @@ Runtime behavior:
 - critical uses the stricter age policy, then runs plain Nix garbage collection;
 - system or nix-darwin generations are reported for operator review but are not
   deleted by the unprivileged plugin path;
+- low-reclaim dry-runs run `nix-store --gc --print-roots` and emit protected
+  `nix_gc_root` targets so operators can see whether profiles, gcroots,
+  workspace `result` links, temporary roots, or active processes are pinning the
+  store;
 - `nix-store --optimize` runs only when `allow_store_optimize: true`.
 
 Recommended Darwin developer-machine defaults are the repo defaults above.
@@ -61,7 +67,10 @@ nix:
   skip_when_daemon_busy: true
   daemon_busy_backoff: 15m
   max_gc_duration: 15m
+  root_attribution_limit: 20
 ```
 
 Keep `skip_when_daemon_busy` enabled on build runners. A cleanup cycle that
 breaks an active Nix build or remote-cache proof is worse than a deferred GC.
+Set `root_attribution_limit: 0` only for hosts where dry-run root enumeration is
+too noisy or too expensive.
