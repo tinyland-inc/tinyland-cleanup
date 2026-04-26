@@ -50,6 +50,8 @@ All notable changes to this project will be documented in this file.
   Node.js, Python, Rust, Go, Haskell, and LM Studio.
 - Typed Darwin developer-cache targets for VS Code and Cursor cache-only
   directories, with active-editor protection.
+- CLI `--plugins` filter for bounded dry-run evidence collection and targeted
+  cleanup cycles.
 
 ### Changed
 

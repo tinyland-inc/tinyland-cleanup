@@ -16,6 +16,7 @@
 //	-level string     Force cleanup level: none, warning, moderate, aggressive, critical
 //	-dry-run          Show what would be cleaned without actually cleaning
 //	-output string    Output format: text, json (default: text)
+//	-plugins string   Comma-separated plugin names to run or plan
 //	-target-used-percent int
 //	                 Override target maximum used-space percentage after cleanup
 //	-verbose          Enable verbose logging
@@ -32,6 +33,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -56,6 +58,7 @@ func main() {
 		level       = flag.String("level", "", "Force cleanup level")
 		dryRun      = flag.Bool("dry-run", false, "Show what would be cleaned")
 		output      = flag.String("output", "text", "Output format: text, json")
+		pluginNames = flag.String("plugins", "", "Comma-separated plugin names to run or plan")
 		targetUsed  = flag.Int("target-used-percent", 0, "Override target maximum used-space percentage after cleanup")
 		verbose     = flag.Bool("verbose", false, "Enable verbose logging")
 		showVersion = flag.Bool("version", false, "Print version and exit")
@@ -69,6 +72,11 @@ func main() {
 
 	if *output != "text" && *output != "json" {
 		fmt.Fprintf(os.Stderr, "invalid output format %q: expected text or json\n", *output)
+		os.Exit(2)
+	}
+	pluginFilter, err := parsePluginFilter(*pluginNames)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
 
@@ -118,6 +126,10 @@ func main() {
 	// Create plugin registry and register all plugins
 	registry := plugins.NewRegistry()
 	registerPlugins(registry)
+	if err := validatePluginFilter(pluginFilter, registry); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
 
 	// Create disk monitor
 	diskMon := monitor.NewDiskMonitor(
@@ -129,15 +141,16 @@ func main() {
 
 	// Create cleanup daemon
 	d := &daemon{
-		config:    cfg,
-		registry:  registry,
-		monitor:   diskMon,
-		logger:    logger,
-		dryRun:    *dryRun,
-		output:    *output,
-		report:    os.Stdout,
-		diskStats: monitor.GetDiskStats,
-		now:       time.Now,
+		config:       cfg,
+		registry:     registry,
+		monitor:      diskMon,
+		logger:       logger,
+		dryRun:       *dryRun,
+		output:       *output,
+		pluginFilter: pluginFilter,
+		report:       os.Stdout,
+		diskStats:    monitor.GetDiskStats,
+		now:          time.Now,
 	}
 
 	// Determine operation mode
@@ -188,15 +201,16 @@ func main() {
 }
 
 type daemon struct {
-	config    *config.Config
-	registry  *plugins.Registry
-	monitor   *monitor.DiskMonitor
-	logger    *slog.Logger
-	dryRun    bool
-	output    string
-	report    io.Writer
-	diskStats func(path string) (*monitor.DiskStats, error)
-	now       func() time.Time
+	config       *config.Config
+	registry     *plugins.Registry
+	monitor      *monitor.DiskMonitor
+	logger       *slog.Logger
+	dryRun       bool
+	output       string
+	pluginFilter []string
+	report       io.Writer
+	diskStats    func(path string) (*monitor.DiskStats, error)
+	now          func() time.Time
 }
 
 func (d *daemon) run(ctx context.Context) error {
@@ -230,12 +244,13 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 
 	now := d.currentTime()
 	report := cycleReport{
-		Timestamp:   now.UTC().Format(time.RFC3339),
-		DryRun:      d.dryRun,
-		ForcedLevel: forcedLevel != monitor.LevelNone,
-		Level:       level.String(),
-		MonitorPath: d.primaryMonitorPath(assessment),
-		Mounts:      assessment.Mounts,
+		Timestamp:    now.UTC().Format(time.RFC3339),
+		DryRun:       d.dryRun,
+		ForcedLevel:  forcedLevel != monitor.LevelNone,
+		Level:        level.String(),
+		MonitorPath:  d.primaryMonitorPath(assessment),
+		Mounts:       assessment.Mounts,
+		PluginFilter: d.pluginFilter,
 	}
 
 	cooldown := d.cleanupCooldown()
@@ -267,7 +282,7 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 	pluginLevel := plugins.CleanupLevel(level)
 
 	// Run cleanup plugins
-	enabledPlugins := d.registry.GetEnabled(d.config)
+	enabledPlugins := filterEnabledPlugins(d.registry.GetEnabled(d.config), d.pluginFilter)
 	d.logger.Debug("running plugins", "count", len(enabledPlugins))
 
 	var totalFreed int64
@@ -417,6 +432,7 @@ type cycleReport struct {
 	TotalBytesFreed   int64               `json:"total_bytes_freed"`
 	TotalItemsCleaned int                 `json:"total_items_cleaned"`
 	Mounts            []mountReport       `json:"mounts"`
+	PluginFilter      []string            `json:"plugin_filter,omitempty"`
 	Plugins           []pluginCycleReport `json:"plugins"`
 }
 
@@ -681,6 +697,76 @@ func applyTargetUsedPercentOverride(cfg *config.Config, targetUsedPercent int) e
 	}
 	cfg.TargetFree = targetUsedPercent
 	return nil
+}
+
+func parsePluginFilter(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	seen := make(map[string]struct{})
+	var filter []string
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			return nil, fmt.Errorf("invalid plugins filter %q: empty plugin name", raw)
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		filter = append(filter, name)
+	}
+	return filter, nil
+}
+
+func validatePluginFilter(filter []string, registry *plugins.Registry) error {
+	if len(filter) == 0 {
+		return nil
+	}
+
+	available := make(map[string]struct{})
+	for _, name := range availablePluginNames(registry) {
+		available[name] = struct{}{}
+	}
+	for _, name := range filter {
+		if _, ok := available[name]; !ok {
+			return fmt.Errorf("unknown plugin %q; available plugins: %s", name, strings.Join(availablePluginNames(registry), ", "))
+		}
+	}
+	return nil
+}
+
+func availablePluginNames(registry *plugins.Registry) []string {
+	seen := make(map[string]struct{})
+	for _, plugin := range registry.GetAll() {
+		seen[plugin.Name()] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func filterEnabledPlugins(enabled []plugins.Plugin, filter []string) []plugins.Plugin {
+	if len(filter) == 0 {
+		return enabled
+	}
+
+	allowed := make(map[string]struct{}, len(filter))
+	for _, name := range filter {
+		allowed[name] = struct{}{}
+	}
+	filtered := make([]plugins.Plugin, 0, len(enabled))
+	for _, plugin := range enabled {
+		if _, ok := allowed[plugin.Name()]; ok {
+			filtered = append(filtered, plugin)
+		}
+	}
+	return filtered
 }
 
 func expandPathHome(path string) string {

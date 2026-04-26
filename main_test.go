@@ -156,6 +156,49 @@ func TestRunOnceDryRunTextReportExplainsPlan(t *testing.T) {
 	}
 }
 
+func TestRunOnceDryRunHonorsPluginFilter(t *testing.T) {
+	var output bytes.Buffer
+	first := &planningPlugin{
+		reportingPlugin: reportingPlugin{name: "first"},
+		plan: plugins.CleanupPlan{
+			Plugin:   "first",
+			Level:    "critical",
+			Summary:  "first plan",
+			WouldRun: true,
+		},
+	}
+	second := &planningPlugin{
+		reportingPlugin: reportingPlugin{name: "second"},
+		plan: plugins.CleanupPlan{
+			Plugin:   "second",
+			Level:    "critical",
+			Summary:  "second plan",
+			WouldRun: true,
+		},
+	}
+	daemon := newTestDaemonWithPlugins(t, &output, first, second)
+	daemon.dryRun = true
+	daemon.pluginFilter = []string{"second"}
+
+	if err := daemon.runOnce(context.Background(), monitor.LevelCritical); err != nil {
+		t.Fatalf("runOnce failed: %v", err)
+	}
+
+	report := decodeCycleReport(t, output.Bytes())
+	if len(report.PluginFilter) != 1 || report.PluginFilter[0] != "second" {
+		t.Fatalf("expected plugin filter [second], got %#v", report.PluginFilter)
+	}
+	if len(report.Plugins) != 1 {
+		t.Fatalf("expected 1 plugin report, got %d", len(report.Plugins))
+	}
+	if report.Plugins[0].Name != "second" {
+		t.Fatalf("expected second plugin, got %q", report.Plugins[0].Name)
+	}
+	if report.Plugins[0].Plan == nil || report.Plugins[0].Plan.Summary != "second plan" {
+		t.Fatalf("expected second plan, got %#v", report.Plugins[0].Plan)
+	}
+}
+
 func TestRunOnceCleanupJSONReport(t *testing.T) {
 	var output bytes.Buffer
 	mock := &reportingPlugin{
@@ -291,6 +334,40 @@ func TestApplyTargetUsedPercentOverride(t *testing.T) {
 		if err := applyTargetUsedPercentOverride(cfg, value); err == nil {
 			t.Fatalf("expected error for target override %d", value)
 		}
+	}
+}
+
+func TestParsePluginFilter(t *testing.T) {
+	filter, err := parsePluginFilter(" bazel, nix,bazel ")
+	if err != nil {
+		t.Fatalf("parsePluginFilter failed: %v", err)
+	}
+	if len(filter) != 2 || filter[0] != "bazel" || filter[1] != "nix" {
+		t.Fatalf("unexpected filter %#v", filter)
+	}
+
+	empty, err := parsePluginFilter("")
+	if err != nil {
+		t.Fatalf("empty filter failed: %v", err)
+	}
+	if empty != nil {
+		t.Fatalf("expected nil empty filter, got %#v", empty)
+	}
+
+	if _, err := parsePluginFilter("bazel,,nix"); err == nil {
+		t.Fatal("expected empty plugin name error")
+	}
+}
+
+func TestValidatePluginFilterRejectsUnknownPlugin(t *testing.T) {
+	registry := plugins.NewRegistry()
+	registry.Register(&reportingPlugin{name: "known"})
+
+	if err := validatePluginFilter([]string{"known"}, registry); err != nil {
+		t.Fatalf("known plugin should validate: %v", err)
+	}
+	if err := validatePluginFilter([]string{"missing"}, registry); err == nil {
+		t.Fatal("expected unknown plugin error")
 	}
 }
 

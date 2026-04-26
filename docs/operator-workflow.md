@@ -20,6 +20,21 @@ Use JSON when another tool needs the stable report schema:
 tinyland-cleanup --once --dry-run --level critical --output json
 ```
 
+When gathering evidence on an active workstation, constrain the run to the
+plugin family under review instead of scanning every enabled cache surface:
+
+```sh
+tinyland-cleanup --once --dry-run --level critical --plugins bazel --output text
+tinyland-cleanup --once --dry-run --level critical --plugins nix --output json
+tinyland-cleanup --once --dry-run --level critical --plugins cache --output text
+```
+
+The plugin filter is comma-separated and preserves the normal registry order:
+
+```sh
+tinyland-cleanup --once --dry-run --level critical --plugins bazel,nix --output json
+```
+
 For a one-off operator run, override the configured maximum used-space target
 without editing config:
 
@@ -37,6 +52,7 @@ The JSON report includes:
 - daemon state file and configured cleanup cooldown;
 - top-level dry-run totals for planned estimated reclaim, required free space,
   and cleanup target count;
+- optional `plugin_filter` when `--plugins` constrains the cycle;
 - enabled plugins that would run;
 - plugin descriptions and dry-run skip reasons.
 
