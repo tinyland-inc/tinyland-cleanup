@@ -35,6 +35,9 @@ type Config struct {
 	// Podman-specific settings
 	Podman PodmanConfig `yaml:"podman"`
 
+	// Bazel-specific cache settings
+	Bazel BazelConfig `yaml:"bazel"`
+
 	// Nix-specific cleanup settings
 	Nix NixConfig `yaml:"nix"`
 
@@ -120,6 +123,8 @@ type EnableFlags struct {
 	Photos bool `yaml:"photos"`
 	// DevArtifacts for stale development artifact cleanup
 	DevArtifacts bool `yaml:"dev_artifacts"`
+	// Bazel for Bazel output base and cache cleanup planning
+	Bazel bool `yaml:"bazel"`
 	// APFSSnapshots for APFS snapshot thinning (Darwin)
 	APFSSnapshots bool `yaml:"apfs_snapshots"`
 }
@@ -164,6 +169,28 @@ type PodmanConfig struct {
 	CompactKeepBackupUntilRestart bool `yaml:"compact_keep_backup_until_restart"`
 	// CompactProviderAllowlist restricts offline compaction to known providers
 	CompactProviderAllowlist []string `yaml:"compact_provider_allowlist"`
+}
+
+// BazelConfig holds Bazel output base and cache cleanup settings.
+type BazelConfig struct {
+	// Roots are directories that may contain Bazel output-user-root trees or caches.
+	Roots []string `yaml:"roots"`
+	// BazeliskCache is the Bazelisk download cache path.
+	BazeliskCache string `yaml:"bazelisk_cache"`
+	// MaxTotalGB is the review budget across detected Bazel caches.
+	MaxTotalGB int `yaml:"max_total_gb"`
+	// KeepRecentOutputBases preserves this many newest output bases.
+	KeepRecentOutputBases int `yaml:"keep_recent_output_bases"`
+	// StaleAfter is the normal age threshold for output-base deletion candidates.
+	StaleAfter string `yaml:"stale_after"`
+	// CriticalStaleAfter is the critical-level age threshold.
+	CriticalStaleAfter string `yaml:"critical_stale_after"`
+	// ProtectWorkspaces preserves output bases reachable from these workspaces.
+	ProtectWorkspaces []string `yaml:"protect_workspaces"`
+	// AllowStopIdleServers allows future cleanup to stop idle Bazel servers.
+	AllowStopIdleServers bool `yaml:"allow_stop_idle_servers"`
+	// AllowDeleteActiveOutputBases allows future cleanup to delete active output bases.
+	AllowDeleteActiveOutputBases bool `yaml:"allow_delete_active_output_bases"`
 }
 
 // NixConfig holds Nix store and profile generation cleanup settings.
@@ -278,6 +305,10 @@ func DefaultConfig() *Config {
 		filepath.Join(home, "src"),
 		filepath.Join(home, "projects"),
 	}
+	bazeliskCache := filepath.Join(home, ".cache", "bazelisk")
+	if runtime.GOOS == "darwin" {
+		bazeliskCache = filepath.Join(home, "Library", "Caches", "bazelisk")
+	}
 
 	config := &Config{
 		PollInterval: 60,
@@ -301,6 +332,7 @@ func DefaultConfig() *Config {
 			ICloud:        runtime.GOOS == "darwin",
 			Photos:        runtime.GOOS == "darwin",
 			DevArtifacts:  true,
+			Bazel:         true,
 			APFSSnapshots: runtime.GOOS == "darwin",
 		},
 		Docker: DockerConfig{
@@ -317,6 +349,20 @@ func DefaultConfig() *Config {
 			CompactRequireNoActiveContainers: true,
 			CompactKeepBackupUntilRestart:    true,
 			CompactProviderAllowlist:         []string{"applehv", "libkrun", "qemu"},
+		},
+		Bazel: BazelConfig{
+			Roots:                 defaultBazelRoots(home),
+			BazeliskCache:         bazeliskCache,
+			MaxTotalGB:            20,
+			KeepRecentOutputBases: 5,
+			StaleAfter:            "14d",
+			CriticalStaleAfter:    "3d",
+			ProtectWorkspaces: []string{
+				filepath.Join(home, "git", "lab"),
+				filepath.Join(home, "git", "GloriousFlywheel"),
+			},
+			AllowStopIdleServers:         true,
+			AllowDeleteActiveOutputBases: false,
 		},
 		Nix: NixConfig{
 			MinUserGenerations:                 5,
@@ -387,6 +433,19 @@ func DefaultConfig() *Config {
 	}
 
 	return config
+}
+
+func defaultBazelRoots(home string) []string {
+	roots := []string{filepath.Join(home, ".cache", "bazel")}
+	if runtime.GOOS == "darwin" {
+		if user := os.Getenv("USER"); user != "" {
+			roots = append(roots,
+				filepath.Join("/private", "var", "tmp", "_bazel_"+user),
+				filepath.Join("/var", "tmp", "_bazel_"+user),
+			)
+		}
+	}
+	return roots
 }
 
 // LoadConfig loads configuration from a YAML file, merging with defaults.

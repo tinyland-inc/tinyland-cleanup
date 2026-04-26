@@ -88,6 +88,7 @@ go_test(
 go_library(
     name = "plugins",
     srcs = [
+        "plugins/bazel.go",
         "plugins/cache.go",
         "plugins/devartifacts.go",
         "plugins/docker.go",
@@ -120,6 +121,7 @@ go_library(
 go_test(
     name = "plugins_test",
     srcs = [
+        "plugins/bazel_test.go",
         "plugins/devartifacts_test.go",
         "plugins/nix_test.go",
         "plugins/podman_compaction_test.go",

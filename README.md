@@ -67,6 +67,9 @@ Darwin developer cache review is documented in
 Nix store and generation cleanup policy is documented in
 [docs/nix-cleanup-policy.md](docs/nix-cleanup-policy.md).
 
+Bazel cache and output-base review is documented in
+[docs/bazel-cache-policy.md](docs/bazel-cache-policy.md).
+
 ## Distribution Status
 
 Current package authority is the Nix flake package `.#tinyland-cleanup`.

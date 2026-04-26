@@ -26,6 +26,7 @@ enable:
   gitlab_runner: true   # GitLab runner cache cleanup
   github_runner: true   # GitHub Actions runner cleanup (Linux only)
   yum: true             # DNF/YUM package cache cleanup (Linux only)
+  bazel: true           # Bazel output base and cache cleanup planning
 
 # GitHub Actions runner settings (Linux only)
 github_runner:
@@ -77,6 +78,22 @@ nix:
   skip_when_daemon_busy: true
   daemon_busy_backoff: 30m
   max_gc_duration: 20m
+
+# Bazel output base and cache review settings
+bazel:
+  roots:
+    - ~/.cache/bazel
+  # Darwin default; Linux operators commonly use ~/.cache/bazelisk
+  bazelisk_cache: ~/Library/Caches/bazelisk
+  max_total_gb: 20
+  keep_recent_output_bases: 5
+  stale_after: 14d
+  critical_stale_after: 3d
+  protect_workspaces:
+    - ~/git/lab
+    - ~/git/GloriousFlywheel
+  allow_stop_idle_servers: true
+  allow_delete_active_output_bases: false
 
 # Lima VM settings (macOS)
 lima:
