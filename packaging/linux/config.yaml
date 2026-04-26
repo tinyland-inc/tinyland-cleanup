@@ -65,6 +65,7 @@ nix:
   skip_when_daemon_busy: true
   daemon_busy_backoff: 30m
   max_gc_duration: 20m
+  root_attribution_limit: 20
 
 bazel:
   roots:

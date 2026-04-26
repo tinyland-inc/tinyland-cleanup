@@ -86,6 +86,10 @@ nix:
   skip_when_daemon_busy: true
   daemon_busy_backoff: 30m
   max_gc_duration: 20m
+  # When dry-run GC reports no reclaimable space, show up to this many visible
+  # GC roots so operators can identify what is pinning the store. Set 0 to
+  # disable root attribution.
+  root_attribution_limit: 20
 
 # Bazel output base and cache review settings
 bazel:

@@ -35,6 +35,8 @@ All notable changes to this project will be documented in this file.
   cache, Haskell caches, and opt-in LM Studio model caches.
 - Opt-in Darwin developer-cache enforcement for typed JetBrains, Playwright,
   Bazelisk, and pip cache targets.
+- Nix low-reclaim dry-runs now emit protected GC-root attribution targets so
+  operators can see what is pinning the store before taking action.
 
 ### Changed
 

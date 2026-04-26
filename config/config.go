@@ -222,6 +222,8 @@ type NixConfig struct {
 	DaemonBusyBackoff string `yaml:"daemon_busy_backoff"`
 	// MaxGCDuration bounds nix-collect-garbage and related Nix commands.
 	MaxGCDuration string `yaml:"max_gc_duration"`
+	// RootAttributionLimit limits visible GC root targets in low-reclaim dry-runs.
+	RootAttributionLimit int `yaml:"root_attribution_limit"`
 }
 
 // ICloudConfig holds iCloud-specific cleanup settings (Darwin).
@@ -392,6 +394,7 @@ func DefaultConfig() *Config {
 			SkipWhenDaemonBusy:                 true,
 			DaemonBusyBackoff:                  "30m",
 			MaxGCDuration:                      "20m",
+			RootAttributionLimit:               20,
 		},
 		Lima: LimaConfig{
 			VMNames: []string{"colima", "unified"},
