@@ -28,6 +28,8 @@ All notable changes to this project will be documented in this file.
   active-process inspection and permission normalization.
 - Linux RPM packaging configuration, systemd unit, packaged config defaults,
   and release workflow RPM artifacts.
+- Persistent daemon cleanup state with per-plugin cooldowns for non-critical
+  daemon-triggered cleanup cycles.
 
 ### Changed
 

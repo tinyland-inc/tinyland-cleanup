@@ -9,6 +9,10 @@ poll_interval: 60
 log_file: /var/log/tinyland-cleanup/tinyland-cleanup.log
 target_free: 70
 
+policy:
+  cooldown: 30m
+  state_file: /var/lib/tinyland-cleanup/state.json
+
 thresholds:
   warning: 80
   moderate: 85

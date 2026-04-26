@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Jesssullivan/tinyland-cleanup/config"
 	"github.com/Jesssullivan/tinyland-cleanup/monitor"
@@ -219,6 +221,87 @@ func TestRunOnceStopsAfterTargetFreeMet(t *testing.T) {
 	}
 }
 
+func TestRunOnceSkipsPluginDuringCooldown(t *testing.T) {
+	var output bytes.Buffer
+	mock := &reportingPlugin{}
+	daemon := newTestDaemon(t, mock, &output)
+	now := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+	daemon.now = func() time.Time { return now }
+	daemon.config.Policy.Cooldown = "30m"
+	daemon.config.Policy.StateFile = filepath.Join(t.TempDir(), "state.json")
+	state := newCleanupState()
+	state.recordPluginRun("reporting", plugins.LevelAggressive, now.Add(-10*time.Minute), plugins.CleanupResult{
+		Plugin:     "reporting",
+		Level:      plugins.LevelAggressive,
+		BytesFreed: 1,
+	})
+	if err := saveCleanupState(daemon.config.Policy.StateFile, state); err != nil {
+		t.Fatal(err)
+	}
+	daemon.diskStats = sequenceDiskStats(t,
+		diskStats(1000, 100, 90),
+		diskStats(1000, 100, 90),
+		diskStats(1000, 100, 90),
+	)
+
+	if err := daemon.runOnce(context.Background(), monitor.LevelNone); err != nil {
+		t.Fatalf("runOnce failed: %v", err)
+	}
+
+	if mock.called {
+		t.Fatal("plugin should be skipped during cooldown")
+	}
+	report := decodeCycleReport(t, output.Bytes())
+	if report.CooldownSeconds != 1800 {
+		t.Fatalf("expected cooldown seconds 1800, got %d", report.CooldownSeconds)
+	}
+	if len(report.Plugins) != 1 {
+		t.Fatalf("expected 1 plugin report, got %d", len(report.Plugins))
+	}
+	if report.Plugins[0].SkipReason != "cooldown" {
+		t.Fatalf("expected cooldown skip reason, got %q", report.Plugins[0].SkipReason)
+	}
+	if report.Plugins[0].CooldownRemainingSeconds != 1200 {
+		t.Fatalf("expected 1200s cooldown remaining, got %d", report.Plugins[0].CooldownRemainingSeconds)
+	}
+}
+
+func TestRunOnceCriticalBypassesCooldown(t *testing.T) {
+	var output bytes.Buffer
+	mock := &reportingPlugin{}
+	daemon := newTestDaemon(t, mock, &output)
+	now := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+	daemon.now = func() time.Time { return now }
+	daemon.config.Policy.Cooldown = "30m"
+	daemon.config.Policy.StateFile = filepath.Join(t.TempDir(), "state.json")
+	state := newCleanupState()
+	state.recordPluginRun("reporting", plugins.LevelCritical, now.Add(-10*time.Minute), plugins.CleanupResult{
+		Plugin: "reporting",
+		Level:  plugins.LevelCritical,
+	})
+	if err := saveCleanupState(daemon.config.Policy.StateFile, state); err != nil {
+		t.Fatal(err)
+	}
+	daemon.diskStats = sequenceDiskStats(t,
+		diskStats(1000, 20, 98),
+		diskStats(1000, 20, 98),
+		diskStats(1000, 20, 98),
+		diskStats(1000, 20, 98),
+	)
+
+	if err := daemon.runOnce(context.Background(), monitor.LevelNone); err != nil {
+		t.Fatalf("runOnce failed: %v", err)
+	}
+
+	if !mock.called {
+		t.Fatal("critical cleanup should bypass cooldown")
+	}
+	report := decodeCycleReport(t, output.Bytes())
+	if report.Plugins[0].SkipReason == "cooldown" {
+		t.Fatal("critical cleanup should not report cooldown skip")
+	}
+}
+
 func newTestDaemon(t *testing.T, plugin plugins.Plugin, output io.Writer) *daemon {
 	t.Helper()
 
@@ -242,6 +325,7 @@ func newTestDaemonWithPlugins(t *testing.T, output io.Writer, registeredPlugins 
 		output:    "json",
 		report:    output,
 		diskStats: monitor.GetDiskStats,
+		now:       time.Now,
 	}
 }
 

@@ -25,7 +25,10 @@ go_binary(
 
 go_library(
     name = "tinyland-cleanup_lib",
-    srcs = ["main.go"] + select({
+    srcs = [
+        "main.go",
+        "state.go",
+    ] + select({
         "@platforms//os:macos": ["plugins_darwin.go"],
         "//conditions:default": ["plugins_other.go"],
     }),
@@ -40,7 +43,10 @@ go_library(
 
 go_test(
     name = "tinyland-cleanup_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "main_test.go",
+        "state_test.go",
+    ],
     embed = [":tinyland-cleanup_lib"],
     deps = [
         ":config",
