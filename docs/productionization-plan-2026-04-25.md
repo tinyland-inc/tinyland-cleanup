@@ -1,6 +1,7 @@
 # Productionization Plan: tinyland-cleanup
 
 Date: 2026-04-25
+Last reviewed: 2026-04-26
 
 ## Current Authority
 
@@ -17,7 +18,8 @@ Date: 2026-04-25
 - GitHub `#4`: Nix cleanup policy for generations, roots, and daemon contention
 - GitHub `#5`: Darwin IDE and developer-tool cache budgets
 - GitHub `#6`: Podman offline compaction for Darwin `applehv`
-- GitHub `#7`: dry-run, telemetry, and host free-space accounting
+- GitHub `#7`: dry-run, telemetry, and host free-space accounting (closed)
+- GitHub `#9`: GloriousFlywheel shared-cache runner proof
 - Linear `TIN-117`: canonical repo decision for `tinyland-cleanup`
 - Linear `TIN-139`: Nix/Bazel audit and cleanup
 - Linear `TIN-127`: Linux builder and publication contracts
@@ -40,10 +42,11 @@ Follow the scheduling package pattern where artifact authority is explicit:
 - Add hosted GitHub CI for Go and Bazel validation.
 - Add manual GloriousFlywheel proof workflow for shared-cache validation.
 
-Validation note: Go, Nix, and hosted Bazel CI are green as of 2026-04-25.
-Bazel now gets past the previous missing-module failure, but local Darwin
-validation still has a rules_go cold-start blocker before tests execute. See
-[validation-status-2026-04-25.md](validation-status-2026-04-25.md).
+Validation note: Go and hosted Bazel CI are green on `main` as of 2026-04-26.
+Local Go test, vet, and build validation also passed on 2026-04-26. The
+GloriousFlywheel proof workflow is present but blocked because this repository
+currently has zero visible self-hosted runners. See
+[validation-status-2026-04-26.md](validation-status-2026-04-26.md).
 
 Exit criteria:
 
@@ -62,7 +65,8 @@ Exit criteria:
 
 Exit criteria:
 
-- GitHub `#2` and `#7` acceptance criteria are testable.
+- GitHub `#2` residual acceptance criteria are testable, and the closed `#7`
+  reporting surface stays covered by tests.
 - Operator output can explain every removal candidate.
 - Mission-critical machines can run in audit mode without mutation.
 

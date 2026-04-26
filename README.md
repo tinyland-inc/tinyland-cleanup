@@ -88,9 +88,10 @@ Bazel cache and output-base review is documented in
 ## Distribution Status
 
 Current package authority is the Nix flake package `.#tinyland-cleanup`.
-Release archives are produced from GitHub tags. Linux RPM packaging is
-documented in [docs/rpm-packaging.md](docs/rpm-packaging.md); the RPM installs a
-systemd unit but leaves enable/start as an explicit operator action.
+Release archives are produced from GitHub tags. No public tag has been cut yet.
+Linux RPM packaging is documented in
+[docs/rpm-packaging.md](docs/rpm-packaging.md); the RPM installs a systemd unit
+but leaves enable/start as an explicit operator action.
 
 ## Roadmap
 
@@ -101,10 +102,14 @@ Open productionization work is tracked in GitHub issues:
 - `#4`: Nix cleanup policy for generations, roots, and daemon contention
 - `#5`: Darwin IDE and developer-tool cache budgets
 - `#6`: Podman offline compaction for Darwin `applehv`
+- `#9`: GloriousFlywheel shared-cache runner proof
+
+Recently completed productionization work:
+
 - `#7`: dry-run, telemetry, and host free-space accounting
 
 See [docs/productionization-plan-2026-04-25.md](docs/productionization-plan-2026-04-25.md)
 for the current productionization plan.
 
 Current validation notes are tracked in
-[docs/validation-status-2026-04-25.md](docs/validation-status-2026-04-25.md).
+[docs/validation-status-2026-04-26.md](docs/validation-status-2026-04-26.md).
