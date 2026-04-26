@@ -371,6 +371,81 @@ func TestValidatePluginFilterRejectsUnknownPlugin(t *testing.T) {
 	}
 }
 
+func TestListPluginEntriesReportsEnabledAndPlatformSupport(t *testing.T) {
+	cfg := config.DefaultConfig()
+	registry := plugins.NewRegistry()
+	registry.Register(&reportingPlugin{name: "all"})
+	registry.Register(&reportingPlugin{name: "unsupported", supported: []string{"not-this-platform"}})
+	registry.Register(&reportingPlugin{name: "disabled", disabled: true})
+
+	entries := listPluginEntries(registry, cfg)
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 plugin entries, got %d", len(entries))
+	}
+
+	if entries[0].Name != "all" || !entries[0].Enabled || !entries[0].Supported {
+		t.Fatalf("unexpected all entry: %#v", entries[0])
+	}
+	if entries[1].Name != "unsupported" || !entries[1].Enabled || entries[1].Supported {
+		t.Fatalf("unexpected unsupported entry: %#v", entries[1])
+	}
+	if entries[2].Name != "disabled" || entries[2].Enabled || !entries[2].Supported {
+		t.Fatalf("unexpected disabled entry: %#v", entries[2])
+	}
+}
+
+func TestWritePluginListText(t *testing.T) {
+	var output bytes.Buffer
+	err := writePluginList(&output, "text", []pluginListEntry{
+		{
+			Name:               "bazel",
+			Description:        "Bazel cleanup",
+			Enabled:            true,
+			Supported:          true,
+			SupportedPlatforms: nil,
+		},
+		{
+			Name:               "homebrew",
+			Description:        "Homebrew cleanup",
+			Enabled:            false,
+			Supported:          false,
+			SupportedPlatforms: []string{"darwin"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("writePluginList failed: %v", err)
+	}
+
+	text := output.String()
+	for _, want := range []string{
+		"tinyland-cleanup plugins",
+		"- bazel: enabled, supported - Bazel cleanup",
+		"- homebrew: disabled, unsupported on darwin - Homebrew cleanup",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("plugin list text missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestWritePluginListJSON(t *testing.T) {
+	var output bytes.Buffer
+	err := writePluginList(&output, "json", []pluginListEntry{
+		{Name: "nix", Description: "Nix cleanup", Enabled: true, Supported: true},
+	})
+	if err != nil {
+		t.Fatalf("writePluginList failed: %v", err)
+	}
+
+	var report pluginListReport
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatalf("failed to decode plugin list JSON: %v\n%s", err, output.String())
+	}
+	if len(report.Plugins) != 1 || report.Plugins[0].Name != "nix" {
+		t.Fatalf("unexpected plugin list report: %#v", report)
+	}
+}
+
 func TestRunOnceSkipsPluginDuringCooldown(t *testing.T) {
 	var output bytes.Buffer
 	mock := &reportingPlugin{}
@@ -519,9 +594,11 @@ func decodeCycleReport(t *testing.T, data []byte) cycleReport {
 }
 
 type reportingPlugin struct {
-	called bool
-	name   string
-	result plugins.CleanupResult
+	called    bool
+	name      string
+	disabled  bool
+	supported []string
+	result    plugins.CleanupResult
 }
 
 func (p *reportingPlugin) Name() string {
@@ -536,11 +613,11 @@ func (p *reportingPlugin) Description() string {
 }
 
 func (p *reportingPlugin) SupportedPlatforms() []string {
-	return nil
+	return p.supported
 }
 
 func (p *reportingPlugin) Enabled(*config.Config) bool {
-	return true
+	return !p.disabled
 }
 
 func (p *reportingPlugin) Cleanup(context.Context, plugins.CleanupLevel, *config.Config, *slog.Logger) plugins.CleanupResult {

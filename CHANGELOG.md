@@ -52,6 +52,8 @@ All notable changes to this project will be documented in this file.
   directories, with active-editor protection.
 - CLI `--plugins` filter for bounded dry-run evidence collection and targeted
   cleanup cycles.
+- CLI `--list-plugins` discovery output for plugin names, enabled state, and
+  platform support.
 
 ### Changed
 

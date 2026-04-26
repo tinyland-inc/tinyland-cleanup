@@ -16,6 +16,7 @@
 //	-level string     Force cleanup level: none, warning, moderate, aggressive, critical
 //	-dry-run          Show what would be cleaned without actually cleaning
 //	-output string    Output format: text, json (default: text)
+//	-list-plugins     List registered plugin names and exit
 //	-plugins string   Comma-separated plugin names to run or plan
 //	-target-used-percent int
 //	                 Override target maximum used-space percentage after cleanup
@@ -33,6 +34,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -58,6 +60,7 @@ func main() {
 		level       = flag.String("level", "", "Force cleanup level")
 		dryRun      = flag.Bool("dry-run", false, "Show what would be cleaned")
 		output      = flag.String("output", "text", "Output format: text, json")
+		listPlugins = flag.Bool("list-plugins", false, "List registered plugin names and exit")
 		pluginNames = flag.String("plugins", "", "Comma-separated plugin names to run or plan")
 		targetUsed  = flag.Int("target-used-percent", 0, "Override target maximum used-space percentage after cleanup")
 		verbose     = flag.Bool("verbose", false, "Enable verbose logging")
@@ -97,6 +100,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Create plugin registry and register all plugins.
+	registry := plugins.NewRegistry()
+	registerPlugins(registry)
+	if err := validatePluginFilter(pluginFilter, registry); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+	if *listPlugins {
+		if err := writePluginList(os.Stdout, *output, listPluginEntries(registry, cfg)); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write plugin list: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Setup log file directory
 	if err := ensureLogDir(cfg.LogFile); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create log directory: %v\n", err)
@@ -122,14 +140,6 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
-
-	// Create plugin registry and register all plugins
-	registry := plugins.NewRegistry()
-	registerPlugins(registry)
-	if err := validatePluginFilter(pluginFilter, registry); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(2)
-	}
 
 	// Create disk monitor
 	diskMon := monitor.NewDiskMonitor(
@@ -463,6 +473,18 @@ type pluginCycleReport struct {
 	Error                    string               `json:"error,omitempty"`
 }
 
+type pluginListReport struct {
+	Plugins []pluginListEntry `json:"plugins"`
+}
+
+type pluginListEntry struct {
+	Name               string   `json:"name"`
+	Description        string   `json:"description"`
+	Enabled            bool     `json:"enabled"`
+	Supported          bool     `json:"supported"`
+	SupportedPlatforms []string `json:"supported_platforms,omitempty"`
+}
+
 type mountAssessment struct {
 	Level  monitor.CleanupLevel
 	Mounts []mountReport
@@ -767,6 +789,63 @@ func filterEnabledPlugins(enabled []plugins.Plugin, filter []string) []plugins.P
 		}
 	}
 	return filtered
+}
+
+func listPluginEntries(registry *plugins.Registry, cfg *config.Config) []pluginListEntry {
+	registered := registry.GetAll()
+	entries := make([]pluginListEntry, 0, len(registered))
+	for _, plugin := range registered {
+		supportedPlatforms := plugin.SupportedPlatforms()
+		entries = append(entries, pluginListEntry{
+			Name:               plugin.Name(),
+			Description:        plugin.Description(),
+			Enabled:            plugin.Enabled(cfg),
+			Supported:          pluginSupportedOnCurrentPlatform(supportedPlatforms),
+			SupportedPlatforms: supportedPlatforms,
+		})
+	}
+	return entries
+}
+
+func pluginSupportedOnCurrentPlatform(supportedPlatforms []string) bool {
+	if len(supportedPlatforms) == 0 {
+		return true
+	}
+	for _, platform := range supportedPlatforms {
+		if platform == runtime.GOOS {
+			return true
+		}
+	}
+	return false
+}
+
+func writePluginList(w io.Writer, output string, entries []pluginListEntry) error {
+	if output == "json" {
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(pluginListReport{Plugins: entries})
+	}
+
+	if _, err := fmt.Fprintln(w, "tinyland-cleanup plugins"); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		enabled := "disabled"
+		if entry.Enabled {
+			enabled = "enabled"
+		}
+		supported := "unsupported"
+		if entry.Supported {
+			supported = "supported"
+		}
+		if len(entry.SupportedPlatforms) > 0 {
+			supported += " on " + strings.Join(entry.SupportedPlatforms, ",")
+		}
+		if _, err := fmt.Fprintf(w, "- %s: %s, %s - %s\n", entry.Name, enabled, supported, entry.Description); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func expandPathHome(path string) string {
