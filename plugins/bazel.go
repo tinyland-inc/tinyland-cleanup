@@ -79,7 +79,7 @@ func (p *BazelPlugin) buildCleanupPlan(ctx context.Context, level CleanupLevel, 
 			"Discover Bazel output bases, repository caches, disk caches, and Bazelisk downloads",
 			"Measure logical and physical bytes without following repo-local bazel-* symlinks",
 			"Protect active output bases, protected workspace output bases, and newest output bases",
-			"Delete only stale inactive output bases in real cleanup mode at moderate or higher levels",
+			"Delete only stale inactive output bases and budget-excess cache tiers in real cleanup mode at moderate or higher levels",
 		},
 		Metadata: map[string]string{
 			"cleanup_level":                    level.String(),
@@ -106,11 +106,12 @@ func (p *BazelPlugin) buildCleanupPlan(ctx context.Context, level CleanupLevel, 
 	plan.EstimatedBytesFreed = bazelEstimatedCandidateBytes(targets)
 	plan.Metadata["target_count"] = strconv.Itoa(len(targets))
 	plan.Metadata["total_physical_bytes"] = strconv.FormatInt(totalPhysical, 10)
+	plan.Metadata["budget_exceeded"] = strconv.FormatBool(bazelBudgetExceeded(totalPhysical, cfg.Bazel))
 
 	if cfg.Bazel.MaxTotalGB > 0 && totalPhysical > int64(cfg.Bazel.MaxTotalGB)*bazelGiB {
 		plan.Warnings = append(plan.Warnings, "detected Bazel cache footprint exceeds configured review budget")
 	}
-	plan.Warnings = append(plan.Warnings, "Bazel cleanup deletes only stale inactive output bases; repository, disk, and Bazelisk cache budget enforcement remains follow-up work")
+	plan.Warnings = append(plan.Warnings, "Bazel cleanup deletes rebuildable cache tiers only when the total footprint exceeds the configured budget and active-use inspection succeeds")
 	plan.Warnings = append(plan.Warnings, "Bazel byte counts use bounded top-level allocation estimates so dry-run stays responsive on very large output bases")
 
 	return plan, activeErr
@@ -262,8 +263,29 @@ func discoverBazeliskCandidates(root string) []bazelCandidate {
 	}
 
 	var candidates []bazelCandidate
+	shaDownloads := filepath.Join(root, "downloads", "sha256")
+	if entries, err := os.ReadDir(shaDownloads); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			path := filepath.Join(shaDownloads, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			candidates = append(candidates, newBazelCandidate("bazelisk", filepath.Join("sha256", entry.Name()), path, info.ModTime()))
+		}
+	}
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
+			continue
+		}
+		if len(candidates) > 0 && entry.Name() == "downloads" {
+			continue
+		}
+		if entry.Name() == "metadata" {
 			continue
 		}
 		path := filepath.Join(root, entry.Name())
@@ -401,10 +423,14 @@ func bazelPlanTargets(candidates []bazelCandidate, cfg config.BazelConfig, level
 
 	recentOutputBases := newestBazelOutputBases(candidates, cfg.KeepRecentOutputBases)
 	var totalPhysical int64
-	targets := make([]CleanupTarget, 0, len(candidates))
 	for _, candidate := range candidates {
 		totalPhysical += candidate.Physical
-		target := bazelTargetForCandidate(candidate, staleAfter, now, recentOutputBases[candidate.Path], globalActive, level, cfg)
+	}
+
+	budgetExceeded := bazelBudgetExceeded(totalPhysical, cfg)
+	targets := make([]CleanupTarget, 0, len(candidates))
+	for _, candidate := range candidates {
+		target := bazelTargetForCandidate(candidate, staleAfter, now, recentOutputBases[candidate.Path], globalActive, budgetExceeded, level, cfg)
 		targets = append(targets, target)
 	}
 
@@ -415,6 +441,10 @@ func bazelPlanTargets(candidates []bazelCandidate, cfg config.BazelConfig, level
 		return targets[i].Bytes > targets[j].Bytes
 	})
 	return targets, totalPhysical
+}
+
+func bazelBudgetExceeded(totalPhysical int64, cfg config.BazelConfig) bool {
+	return cfg.MaxTotalGB > 0 && totalPhysical > int64(cfg.MaxTotalGB)*bazelGiB
 }
 
 func newestBazelOutputBases(candidates []bazelCandidate, keep int) map[string]bool {
@@ -442,7 +472,7 @@ func newestBazelOutputBases(candidates []bazelCandidate, keep int) map[string]bo
 	return protected
 }
 
-func bazelTargetForCandidate(candidate bazelCandidate, staleAfter time.Duration, now time.Time, protectedByRecent bool, globalActive bool, level CleanupLevel, cfg config.BazelConfig) CleanupTarget {
+func bazelTargetForCandidate(candidate bazelCandidate, staleAfter time.Duration, now time.Time, protectedByRecent bool, globalActive bool, budgetExceeded bool, level CleanupLevel, cfg config.BazelConfig) CleanupTarget {
 	active := candidate.Active || globalActive
 	protected := candidate.Protected || protectedByRecent || (active && !cfg.AllowDeleteActiveOutputBases)
 	action := "review"
@@ -462,8 +492,17 @@ func bazelTargetForCandidate(candidate bazelCandidate, staleAfter time.Duration,
 		action = "review"
 		reason = "warning level reports Bazel cache footprint only"
 	case candidate.Type != "output_base":
-		action = "review_cache_budget"
-		reason = "cache tier budget enforcement is not enabled yet"
+		if !budgetExceeded {
+			action = "review_cache_budget"
+			reason = "within configured Bazel cache budget"
+		} else if candidate.ModTime.After(now.Add(-staleAfter)) {
+			action = "keep"
+			protected = true
+			reason = "newer than configured Bazel cache stale threshold"
+		} else {
+			action = "delete_cache_tier"
+			reason = "cache tier exceeds budget and is older than configured Bazel stale threshold"
+		}
 	case candidate.ModTime.After(now.Add(-staleAfter)):
 		action = "keep"
 		protected = true
@@ -505,24 +544,41 @@ func applyBazelCleanupTargets(ctx context.Context, plugin string, level CleanupL
 			result.Error = err
 			return result
 		}
-		if err := deleteBazelOutputBase(target.Path, logger); err != nil {
-			logger.Warn("failed to delete Bazel output base", "path", target.Path, "error", err)
+		if err := deleteBazelTarget(target, logger); err != nil {
+			logger.Warn("failed to delete Bazel target", "type", target.Type, "path", target.Path, "error", err)
 			continue
 		}
 		result.BytesFreed += target.Bytes
 		result.EstimatedBytesFreed += target.Bytes
 		result.ItemsCleaned++
-		logger.Info("deleted stale Bazel output base", "path", target.Path, "estimated_bytes", target.Bytes)
+		logger.Info("deleted Bazel cleanup target", "type", target.Type, "path", target.Path, "estimated_bytes", target.Bytes)
 	}
 	return result
 }
 
 func bazelTargetEligibleForDeletion(target CleanupTarget) bool {
-	return target.Type == "output_base" &&
-		target.Action == "delete_output_base" &&
-		target.Path != "" &&
-		!target.Active &&
-		!target.Protected
+	if target.Path == "" || target.Active || target.Protected {
+		return false
+	}
+	switch target.Action {
+	case "delete_output_base":
+		return target.Type == "output_base"
+	case "delete_cache_tier":
+		return target.Type == "repository_cache" || target.Type == "disk_cache" || target.Type == "bazelisk"
+	default:
+		return false
+	}
+}
+
+func deleteBazelTarget(target CleanupTarget, logger *slog.Logger) error {
+	switch target.Type {
+	case "output_base":
+		return deleteBazelOutputBase(target.Path, logger)
+	case "repository_cache", "disk_cache", "bazelisk":
+		return deleteBazelCacheTier(target.Type, target.Path, logger)
+	default:
+		return fmt.Errorf("refusing to delete unsupported Bazel target type %q", target.Type)
+	}
 }
 
 func deleteBazelOutputBase(path string, logger *slog.Logger) error {
@@ -533,6 +589,45 @@ func deleteBazelOutputBase(path string, logger *slog.Logger) error {
 		return err
 	}
 	return os.RemoveAll(path)
+}
+
+func deleteBazelCacheTier(targetType, path string, logger *slog.Logger) error {
+	if !bazelCacheTierPathAllowed(targetType, path) {
+		return fmt.Errorf("refusing to delete unsafe Bazel cache tier path: %s", path)
+	}
+	if err := normalizeBazelDeletionPermissions(path, logger); err != nil {
+		return err
+	}
+	return os.RemoveAll(path)
+}
+
+func bazelCacheTierPathAllowed(targetType, path string) bool {
+	path = filepath.Clean(path)
+	if path == "." || path == string(os.PathSeparator) {
+		return false
+	}
+
+	switch targetType {
+	case "repository_cache":
+		return filepath.Base(path) == "repository_cache"
+	case "disk_cache":
+		return filepath.Base(path) == "disk_cache"
+	case "bazelisk":
+		parts := strings.Split(path, string(os.PathSeparator))
+		for idx := 0; idx < len(parts)-1; idx++ {
+			if parts[idx] == "downloads" && parts[idx+1] == "sha256" && idx+2 < len(parts) {
+				return true
+			}
+		}
+		for idx, part := range parts {
+			if part == "bazelisk" && idx < len(parts)-1 {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 func normalizeBazelDeletionPermissions(root string, logger *slog.Logger) error {

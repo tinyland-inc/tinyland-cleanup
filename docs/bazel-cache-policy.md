@@ -2,7 +2,8 @@
 
 Bazel cleanup reports output bases, repository caches, disk caches, and
 Bazelisk downloads. Real cleanup mode deletes only stale inactive output bases
-after active-process inspection succeeds.
+and budget-excess rebuildable cache tiers after active-process inspection
+succeeds.
 
 Review with:
 
@@ -51,13 +52,15 @@ Runtime boundary:
 - moderate, aggressive, and critical classify stale inactive output bases as
   `delete_output_base` candidates in dry-run output and delete those output
   bases in real cleanup mode;
+- moderate, aggressive, and critical classify stale repository cache, disk
+  cache, and Bazelisk download entries as `delete_cache_tier` only when the
+  total Bazel footprint exceeds `max_total_gb`;
 - real cleanup skips Bazel mutation if active Bazel process inspection fails;
+- cache-tier cleanup is skipped while active Bazel or Bazelisk work is visible;
 - deletion normalizes writable permissions first, and on Darwin attempts to
   clear `uchg` file flags with `chflags -R nouchg`;
 - byte counts use top-level allocation estimates so dry-run remains responsive
   on very large generated trees;
-- repository cache, disk cache, and Bazelisk entries are reported for budget
-  review but not deleted yet;
 - repo-local `bazel-*` symlink cleanup remains a follow-up after output-base
   deletion evidence is proven on real hosts.
 
