@@ -78,6 +78,12 @@ For Darwin IDE and tool caches, review
 [darwin-dev-caches.md](darwin-dev-caches.md). These targets are reported for
 operator review before budget enforcement is enabled.
 
+For workspace build artifacts, the `dev-artifacts` plan reports rebuildable
+targets such as `node_modules`, Python virtualenvs, Rust `target/` directories,
+Go build cache, Haskell caches, and opt-in LM Studio model caches. Warning
+level reports only; moderate and above mark eligible stale artifacts as
+deletion or cache-clean targets while preserving configured protected paths.
+
 ## Current Boundary
 
 This is the first stable reporting surface. It now exposes typed targets for
@@ -85,5 +91,5 @@ selected plugins, but not per-file cleanup candidates for every plugin. Real
 cleanup cycles stop remaining plugins after the host reaches the configured
 target. Daemon-triggered non-critical cleanup also honors per-plugin cooldown
 state; explicit `--level` runs and critical pressure bypass cooldown. Treat
-broader candidate planning, active-use evidence, and CLI target-free overrides
-as the next policy layer.
+broader active-use evidence and CLI target-free overrides as the next policy
+layer.
