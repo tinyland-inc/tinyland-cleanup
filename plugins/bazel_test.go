@@ -94,6 +94,125 @@ func TestBazelPlanTargetsProtectsRecentActiveAndWorkspaces(t *testing.T) {
 	}
 }
 
+func TestBazelPlanTargetsDeletesCacheTiersOnlyWhenBudgetExceeded(t *testing.T) {
+	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
+	cfg := config.BazelConfig{
+		MaxTotalGB:           1,
+		StaleAfter:           "14d",
+		CriticalStaleAfter:   "3d",
+		AllowStopIdleServers: true,
+	}
+	candidates := []bazelCandidate{
+		{
+			Type:     "repository_cache",
+			Name:     "repository_cache",
+			Path:     "/tmp/repository_cache",
+			ModTime:  now.Add(-30 * 24 * time.Hour),
+			Physical: 2 * bazelGiB,
+		},
+		{
+			Type:     "disk_cache",
+			Name:     "disk_cache",
+			Path:     "/tmp/disk_cache",
+			ModTime:  now.Add(-30 * 24 * time.Hour),
+			Physical: 2 * bazelGiB,
+		},
+		{
+			Type:     "bazelisk",
+			Name:     "sha256/hash",
+			Path:     "/tmp/bazelisk/downloads/sha256/hash",
+			ModTime:  now.Add(-30 * 24 * time.Hour),
+			Physical: 2 * bazelGiB,
+		},
+		{
+			Type:     "repository_cache",
+			Name:     "fresh_repository_cache",
+			Path:     "/tmp/fresh_repository_cache",
+			ModTime:  now.Add(-1 * 24 * time.Hour),
+			Physical: 2 * bazelGiB,
+		},
+	}
+
+	targets, total := bazelPlanTargets(candidates, cfg, LevelModerate, now, false)
+	if total != 8*bazelGiB {
+		t.Fatalf("total physical = %d, want %d", total, 8*bazelGiB)
+	}
+
+	actions := map[string]CleanupTarget{}
+	for _, target := range targets {
+		actions[target.Name] = target
+	}
+
+	for _, name := range []string{"repository_cache", "disk_cache", "sha256/hash"} {
+		if actions[name].Action != "delete_cache_tier" || actions[name].Protected {
+			t.Fatalf("%s target should be a cache-tier deletion candidate: %#v", name, actions[name])
+		}
+	}
+	if actions["fresh_repository_cache"].Action != "keep" || !actions["fresh_repository_cache"].Protected {
+		t.Fatalf("fresh cache tier should be kept: %#v", actions["fresh_repository_cache"])
+	}
+
+	cfg.MaxTotalGB = 20
+	targets, _ = bazelPlanTargets(candidates[:1], cfg, LevelModerate, now, false)
+	if len(targets) != 1 {
+		t.Fatalf("expected one target, got %d", len(targets))
+	}
+	if targets[0].Action != "review_cache_budget" {
+		t.Fatalf("within-budget cache tier action = %q, want review_cache_budget", targets[0].Action)
+	}
+}
+
+func TestBazelPlanTargetsProtectsCacheTiersWhenBazelActive(t *testing.T) {
+	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
+	cfg := config.BazelConfig{
+		MaxTotalGB:                   1,
+		StaleAfter:                   "14d",
+		AllowDeleteActiveOutputBases: false,
+		KeepRecentOutputBases:        0,
+		CriticalStaleAfter:           "3d",
+	}
+	candidates := []bazelCandidate{
+		{
+			Type:     "disk_cache",
+			Name:     "disk_cache",
+			Path:     "/tmp/disk_cache",
+			ModTime:  now.Add(-30 * 24 * time.Hour),
+			Physical: 2 * bazelGiB,
+		},
+	}
+
+	targets, _ := bazelPlanTargets(candidates, cfg, LevelModerate, now, true)
+	if len(targets) != 1 {
+		t.Fatalf("expected one target, got %d", len(targets))
+	}
+	if targets[0].Action != "keep" || !targets[0].Protected || !targets[0].Active {
+		t.Fatalf("active cache tier should be protected: %#v", targets[0])
+	}
+}
+
+func TestDiscoverBazeliskCandidatesPrefersSha256Downloads(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "bazelisk")
+	sha := filepath.Join(root, "downloads", "sha256", "abc123")
+	metadata := filepath.Join(root, "downloads", "metadata", "bazelbuild")
+	mustMkdir(t, sha)
+	mustMkdir(t, metadata)
+
+	candidates := discoverBazeliskCandidates(root)
+	if len(candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1: %#v", len(candidates), candidates)
+	}
+	if candidates[0].Type != "bazelisk" || candidates[0].Name != filepath.Join("sha256", "abc123") {
+		t.Fatalf("unexpected Bazelisk candidate: %#v", candidates[0])
+	}
+	resolvedSha, err := filepath.EvalSymlinks(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidates[0].Path != resolvedSha {
+		t.Fatalf("candidate path = %q, want %q", candidates[0].Path, resolvedSha)
+	}
+}
+
 func TestOutputBasesProtectedByWorkspaces(t *testing.T) {
 	root := t.TempDir()
 	outputBase := filepath.Join(root, "_bazel_jess", "abc123")
@@ -172,6 +291,87 @@ func TestApplyBazelCleanupTargetsDeletesEligibleOutputBase(t *testing.T) {
 	}
 	if _, err := os.Stat(outputBase); !os.IsNotExist(err) {
 		t.Fatalf("expected output base to be deleted, stat err=%v", err)
+	}
+}
+
+func TestApplyBazelCleanupTargetsDeletesEligibleCacheTier(t *testing.T) {
+	root := t.TempDir()
+	repositoryCache := filepath.Join(root, "repository_cache")
+	mustMkdir(t, repositoryCache)
+	if err := os.WriteFile(filepath.Join(repositoryCache, "artifact"), []byte("artifact"), 0400); err != nil {
+		t.Fatal(err)
+	}
+
+	bazeliskEntry := filepath.Join(root, "bazelisk", "downloads", "sha256", "abc123")
+	mustMkdir(t, bazeliskEntry)
+	if err := os.WriteFile(filepath.Join(bazeliskEntry, "bazel"), []byte("binary"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	customBazeliskEntry := filepath.Join(root, "custom-bazelisk-home", "downloads", "sha256", "def456")
+	mustMkdir(t, customBazeliskEntry)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	result := applyBazelCleanupTargets(context.Background(), "bazel", LevelModerate, []CleanupTarget{
+		{
+			Type:   "repository_cache",
+			Name:   "repository_cache",
+			Path:   repositoryCache,
+			Bytes:  11,
+			Action: "delete_cache_tier",
+		},
+		{
+			Type:   "bazelisk",
+			Name:   "sha256/abc123",
+			Path:   bazeliskEntry,
+			Bytes:  13,
+			Action: "delete_cache_tier",
+		},
+		{
+			Type:   "bazelisk",
+			Name:   "sha256/def456",
+			Path:   customBazeliskEntry,
+			Bytes:  17,
+			Action: "delete_cache_tier",
+		},
+	}, logger)
+
+	if result.Error != nil {
+		t.Fatalf("unexpected error: %v", result.Error)
+	}
+	if result.ItemsCleaned != 3 {
+		t.Fatalf("items cleaned = %d, want 3", result.ItemsCleaned)
+	}
+	if result.EstimatedBytesFreed != 41 || result.BytesFreed != 41 {
+		t.Fatalf("unexpected bytes: estimated=%d legacy=%d", result.EstimatedBytesFreed, result.BytesFreed)
+	}
+	for _, path := range []string{repositoryCache, bazeliskEntry, customBazeliskEntry} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be deleted, stat err=%v", path, err)
+		}
+	}
+}
+
+func TestApplyBazelCleanupTargetsRejectsUnsafeCacheTierPath(t *testing.T) {
+	root := t.TempDir()
+	unsafe := filepath.Join(root, "not_repository_cache")
+	mustMkdir(t, unsafe)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	result := applyBazelCleanupTargets(context.Background(), "bazel", LevelModerate, []CleanupTarget{
+		{
+			Type:   "repository_cache",
+			Name:   "unsafe",
+			Path:   unsafe,
+			Bytes:  10,
+			Action: "delete_cache_tier",
+		},
+	}, logger)
+
+	if result.ItemsCleaned != 0 {
+		t.Fatalf("items cleaned = %d, want 0", result.ItemsCleaned)
+	}
+	if _, err := os.Stat(unsafe); err != nil {
+		t.Fatalf("unsafe path should remain, err=%v", err)
 	}
 }
 

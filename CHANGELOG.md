@@ -42,6 +42,9 @@ All notable changes to this project will be documented in this file.
   representative targets.
 - CLI `--target-used-percent` override for one-off cleanup runs without editing
   config.
+- Bazel cache-tier budget enforcement for stale repository cache, disk cache,
+  and Bazelisk download targets when total Bazel footprint exceeds the
+  configured budget.
 
 ### Changed
 
