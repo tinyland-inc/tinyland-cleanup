@@ -436,6 +436,59 @@ func (p *CachePlugin) Enabled(cfg *config.Config) bool {
 	return cfg.Enable.Cache
 }
 
+// PlanCleanup reports typed Darwin developer-cache candidates without deleting them.
+func (p *CachePlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupPlan {
+	_ = logger
+
+	plan := CleanupPlan{
+		Plugin:   p.Name(),
+		Level:    level.String(),
+		Summary:  "Darwin developer cache review plan",
+		WouldRun: true,
+		Steps: []string{
+			"Measure known Darwin developer caches by physical allocation",
+			"Classify versioned tool caches by cache family and active-use evidence",
+			"Protect settings, application support data, project workspaces, credentials, and active IDE versions",
+		},
+		Metadata: map[string]string{
+			"darwin_dev_caches_enabled": strconv.FormatBool(cfg.DarwinDevCaches.Enabled),
+			"max_total_gb":              strconv.Itoa(cfg.DarwinDevCaches.MaxTotalGB),
+		},
+	}
+
+	if !cfg.DarwinDevCaches.Enabled {
+		plan.WouldRun = false
+		plan.SkipReason = "darwin_dev_caches_disabled"
+		return plan
+	}
+
+	home, _ := os.UserHomeDir()
+	activeProcesses := darwinActiveProcessNames(ctx)
+	targets := p.darwinDeveloperCacheTargets(home, cfg.DarwinDevCaches, activeProcesses)
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].Bytes == targets[j].Bytes {
+			return targets[i].Path < targets[j].Path
+		}
+		return targets[i].Bytes > targets[j].Bytes
+	})
+
+	var total int64
+	for _, target := range targets {
+		total += target.Bytes
+	}
+
+	plan.Targets = targets
+	plan.Metadata["target_count"] = strconv.Itoa(len(targets))
+	plan.Metadata["total_physical_bytes"] = strconv.FormatInt(total, 10)
+
+	if cfg.DarwinDevCaches.MaxTotalGB > 0 && total > int64(cfg.DarwinDevCaches.MaxTotalGB)*1024*1024*1024 {
+		plan.Warnings = append(plan.Warnings, "known Darwin developer caches exceed configured review budget")
+	}
+	plan.Warnings = append(plan.Warnings, "this slice reports typed cache candidates only; budget enforcement remains opt-in follow-up work")
+
+	return plan
+}
+
 // Cleanup performs cache cleanup at the specified level.
 func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{
@@ -549,6 +602,201 @@ func (p *CachePlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *conf
 	}
 
 	return result
+}
+
+type darwinCacheEntry struct {
+	path    string
+	name    string
+	version string
+	modTime time.Time
+	bytes   int64
+}
+
+func (p *CachePlugin) darwinDeveloperCacheTargets(home string, cfg config.DarwinDevCachesConfig, activeProcesses map[string]bool) []CleanupTarget {
+	var targets []CleanupTarget
+
+	if cfg.JetBrains.Enabled {
+		jetBrainsRoot := filepath.Join(home, "Library", "Caches", "JetBrains")
+		jetBrainsActive := cfg.JetBrains.KeepActiveVersions && darwinAnyProcessActive(activeProcesses,
+			"appcode", "clion", "datagrip", "goland", "idea", "intellij", "phpstorm", "pycharm", "rider", "rubymine", "webstorm")
+		for _, entry := range listDarwinCacheEntries(jetBrainsRoot) {
+			targets = append(targets, CleanupTarget{
+				Type:      "jetbrains",
+				Name:      entry.name,
+				Version:   entry.version,
+				Path:      entry.path,
+				Bytes:     entry.bytes,
+				Active:    jetBrainsActive,
+				Protected: jetBrainsActive,
+				Action:    darwinReviewAction(jetBrainsActive),
+				Reason:    darwinReviewReason(jetBrainsActive, "JetBrains cache version"),
+			})
+		}
+	}
+
+	if cfg.Playwright.Enabled {
+		playwrightRoot := filepath.Join(home, "Library", "Caches", "ms-playwright")
+		entries := listDarwinCacheEntries(playwrightRoot)
+		protected := newestPerFamily(entries, cfg.Playwright.KeepLatestPerFamily)
+		for _, entry := range entries {
+			isProtected := protected[entry.path]
+			targets = append(targets, CleanupTarget{
+				Type:      "playwright",
+				Name:      entry.name,
+				Version:   entry.version,
+				Path:      entry.path,
+				Bytes:     entry.bytes,
+				Protected: isProtected,
+				Action:    darwinReviewAction(isProtected),
+				Reason:    darwinReviewReason(isProtected, "Playwright browser revision"),
+			})
+		}
+	}
+
+	if cfg.Bazelisk.Enabled {
+		bazeliskRoot := filepath.Join(home, "Library", "Caches", "bazelisk")
+		entries := listDarwinCacheEntries(bazeliskRoot)
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].modTime.After(entries[j].modTime)
+		})
+		keepLatest := cfg.Bazelisk.KeepLatest
+		for idx, entry := range entries {
+			isProtected := keepLatest > 0 && idx < keepLatest
+			targets = append(targets, CleanupTarget{
+				Type:      "bazelisk",
+				Name:      entry.name,
+				Version:   entry.version,
+				Path:      entry.path,
+				Bytes:     entry.bytes,
+				Protected: isProtected,
+				Action:    darwinReviewAction(isProtected),
+				Reason:    darwinReviewReason(isProtected, "Bazelisk download cache"),
+			})
+		}
+	}
+
+	if cfg.Pip.Enabled {
+		for _, pipPath := range []string{
+			filepath.Join(home, "Library", "Caches", "pip"),
+			filepath.Join(home, ".cache", "pip"),
+		} {
+			if !pathExistsAndIsDir(pipPath) {
+				continue
+			}
+			targets = append(targets, CleanupTarget{
+				Type:   "pip",
+				Name:   filepath.Base(pipPath),
+				Path:   pipPath,
+				Bytes:  getDirAllocatedBytes(pipPath),
+				Action: "review",
+				Reason: fmt.Sprintf("pip cache; stale-after review budget is %d days", cfg.Pip.StaleAfterDays),
+			})
+		}
+	}
+
+	return targets
+}
+
+func listDarwinCacheEntries(root string) []darwinCacheEntry {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+
+	targets := make([]darwinCacheEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		targets = append(targets, darwinCacheEntry{
+			path:    path,
+			name:    entry.Name(),
+			version: darwinCacheVersion(entry.Name()),
+			modTime: info.ModTime(),
+			bytes:   getDirAllocatedBytes(path),
+		})
+	}
+	return targets
+}
+
+func newestPerFamily(entries []darwinCacheEntry, enabled bool) map[string]bool {
+	protected := map[string]bool{}
+	if !enabled {
+		return protected
+	}
+
+	newest := map[string]darwinCacheEntry{}
+	for _, entry := range entries {
+		family := darwinCacheFamily(entry.name)
+		current, ok := newest[family]
+		if !ok || entry.modTime.After(current.modTime) {
+			newest[family] = entry
+		}
+	}
+	for _, entry := range newest {
+		protected[entry.path] = true
+	}
+	return protected
+}
+
+func darwinCacheVersion(name string) string {
+	re := regexp.MustCompile(`(\d+(?:[._-]\d+)+)`)
+	if match := re.FindStringSubmatch(name); len(match) > 1 {
+		return strings.ReplaceAll(match[1], "_", ".")
+	}
+	return ""
+}
+
+func darwinCacheFamily(name string) string {
+	if idx := strings.Index(name, "-"); idx > 0 {
+		return name[:idx]
+	}
+	return name
+}
+
+func darwinReviewAction(protected bool) string {
+	if protected {
+		return "protect"
+	}
+	return "review"
+}
+
+func darwinReviewReason(protected bool, label string) string {
+	if protected {
+		return label + " is protected by active-use or keep-latest policy"
+	}
+	return label + " is a cleanup candidate for a future budget-enforcement pass"
+}
+
+func darwinActiveProcessNames(ctx context.Context) map[string]bool {
+	active := map[string]bool{}
+	output, err := exec.CommandContext(ctx, "ps", "-axo", "comm=").Output()
+	if err != nil {
+		return active
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		name := strings.ToLower(filepath.Base(strings.TrimSpace(line)))
+		if name != "" {
+			active[name] = true
+		}
+	}
+	return active
+}
+
+func darwinAnyProcessActive(active map[string]bool, names ...string) bool {
+	for process := range active {
+		for _, name := range names {
+			if strings.Contains(process, name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Helper functions

@@ -52,9 +52,13 @@ For macOS Podman VM disk compaction, review
 `applehv` raw images is advisory and is not counted as host-side reclaimed
 space.
 
+For Darwin IDE and tool caches, review
+[darwin-dev-caches.md](darwin-dev-caches.md). These targets are reported for
+operator review before budget enforcement is enabled.
+
 ## Current Boundary
 
-This is the first stable reporting surface. It does not yet expose per-file
-cleanup candidates for every plugin. Treat per-plugin candidate planning,
-active-use evidence, cooldown state, and target-free stop behavior as the next
-policy layer.
+This is the first stable reporting surface. It now exposes typed targets for
+selected plugins, but not per-file cleanup candidates for every plugin. Treat
+broader candidate planning, active-use evidence, cooldown state, and
+target-free stop behavior as the next policy layer.

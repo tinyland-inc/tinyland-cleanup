@@ -81,10 +81,34 @@ type CleanupPlan struct {
 	RequiredFreeBytes int64 `json:"required_free_bytes,omitempty"`
 	// Steps lists the operator-visible steps the cleanup would perform.
 	Steps []string `json:"steps,omitempty"`
+	// Targets lists concrete files, directories, or resources considered by the plan.
+	Targets []CleanupTarget `json:"targets,omitempty"`
 	// Warnings lists safety warnings or lossy accounting caveats.
 	Warnings []string `json:"warnings,omitempty"`
 	// Metadata carries plugin-specific plan facts.
 	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// CleanupTarget is one concrete cleanup candidate in a dry-run plan.
+type CleanupTarget struct {
+	// Type is the cache or resource class.
+	Type string `json:"type"`
+	// Name is a short target label.
+	Name string `json:"name"`
+	// Version is the tool or cache version when detectable.
+	Version string `json:"version,omitempty"`
+	// Path is the local filesystem path for file-backed targets.
+	Path string `json:"path,omitempty"`
+	// Bytes is the measured target size.
+	Bytes int64 `json:"bytes"`
+	// Active reports whether active-use evidence was detected.
+	Active bool `json:"active"`
+	// Protected reports whether the plan should preserve the target.
+	Protected bool `json:"protected"`
+	// Action describes the planned action.
+	Action string `json:"action"`
+	// Reason explains why the action was selected.
+	Reason string `json:"reason,omitempty"`
 }
 
 // Plugin is the interface that cleanup plugins must implement.

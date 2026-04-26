@@ -164,6 +164,26 @@ func getFileAllocatedBytes(path string) (int64, error) {
 	return stat.Blocks * 512, nil
 }
 
+func getDirAllocatedBytes(path string) int64 {
+	var size int64
+	filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		allocated, err := getFileAllocatedBytes(p)
+		if err != nil {
+			size += info.Size()
+			return nil
+		}
+		size += allocated
+		return nil
+	})
+	return size
+}
+
 // safeBytesDiff returns the difference between two sizes, floored at 0.
 // Prevents negative BytesFreed when files are added during cleanup.
 func safeBytesDiff(before, after int64) int64 {
