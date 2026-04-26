@@ -64,6 +64,9 @@ enabling offline compaction.
 Darwin developer cache review is documented in
 [docs/darwin-dev-caches.md](docs/darwin-dev-caches.md).
 
+Nix store and generation cleanup policy is documented in
+[docs/nix-cleanup-policy.md](docs/nix-cleanup-policy.md).
+
 ## Distribution Status
 
 Current package authority is the Nix flake package `.#tinyland-cleanup`.

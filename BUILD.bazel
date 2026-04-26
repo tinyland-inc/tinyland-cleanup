@@ -121,6 +121,7 @@ go_test(
     name = "plugins_test",
     srcs = [
         "plugins/devartifacts_test.go",
+        "plugins/nix_test.go",
         "plugins/podman_compaction_test.go",
         "plugins/plugin_pbt_test.go",
         "plugins/plugin_test.go",

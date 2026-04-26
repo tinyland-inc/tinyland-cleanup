@@ -60,6 +60,24 @@ docker:
   # Don't prune images used by running containers
   protect_running_containers: true
 
+# Nix store and profile generation cleanup settings
+nix:
+  # Preserve rollback safety even under disk pressure
+  min_user_generations: 5
+  min_system_generations: 3
+
+  # User generation deletion policy for moderate/aggressive and critical levels
+  delete_generations_older_than: 14d
+  critical_delete_generations_older_than: 3d
+
+  # Store optimization can be disruptive; leave it explicitly opt-in
+  allow_store_optimize: false
+
+  # Avoid fighting active builds, Home Manager switches, and rebuilds
+  skip_when_daemon_busy: true
+  daemon_busy_backoff: 30m
+  max_gc_duration: 20m
+
 # Lima VM settings (macOS)
 lima:
   vm_names:

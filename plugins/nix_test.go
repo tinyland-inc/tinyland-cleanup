@@ -1,0 +1,137 @@
+package plugins
+
+import (
+	"testing"
+	"time"
+)
+
+func TestNixPluginParseDryRunFreedSpace(t *testing.T) {
+	p := NewNixPlugin()
+
+	tests := []struct {
+		name     string
+		output   string
+		expected int64
+	}{
+		{"would free mib", "would delete 42 store paths\nwould free 512.5 MiB", 537395200},
+		{"would be freed gib", "1.25 GiB would be freed", 1342177280},
+		{"fallback freed", "1234 store paths deleted, 2.0 GiB freed", 2147483648},
+		{"bytes", "would free 100 B", 100},
+		{"empty", "", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := p.parseDryRunFreedSpace(tt.output); got != tt.expected {
+				t.Fatalf("parseDryRunFreedSpace(%q) = %d, want %d", tt.output, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNixPluginParseDryRunStorePaths(t *testing.T) {
+	p := NewNixPlugin()
+
+	tests := []struct {
+		output   string
+		expected int
+	}{
+		{"would delete 42 store paths", 42},
+		{"1 store path would be deleted", 1},
+		{"1234 store paths deleted, 2.0 GiB freed", 1234},
+		{"", 0},
+	}
+
+	for _, tt := range tests {
+		if got := p.parseDryRunStorePaths(tt.output); got != tt.expected {
+			t.Fatalf("parseDryRunStorePaths(%q) = %d, want %d", tt.output, got, tt.expected)
+		}
+	}
+}
+
+func TestParseNixPolicyDuration(t *testing.T) {
+	tests := []struct {
+		raw      string
+		expected time.Duration
+	}{
+		{"30m", 30 * time.Minute},
+		{"14d", 14 * 24 * time.Hour},
+		{"2w", 14 * 24 * time.Hour},
+		{"bad", 9 * time.Minute},
+	}
+
+	for _, tt := range tests {
+		if got := parseNixPolicyDuration(tt.raw, 9*time.Minute); got != tt.expected {
+			t.Fatalf("parseNixPolicyDuration(%q) = %s, want %s", tt.raw, got, tt.expected)
+		}
+	}
+}
+
+func TestNixBusyProcessReasons(t *testing.T) {
+	ps := `
+/nix/var/nix/profiles/default/bin/nix nix build .#package
+/run/current-system/sw/bin/home-manager home-manager switch --flake .#jess
+/nix/store/abc/bin/nix-daemon nix-daemon --daemon
+/nix/store/def/bin/nix-daemon nix-daemon --stdio
+/usr/bin/zsh zsh -lc echo idle
+`
+	reasons := nixBusyProcessReasons(ps)
+	want := []string{"home-manager switch", "nix build", "nix-daemon worker"}
+
+	if len(reasons) != len(want) {
+		t.Fatalf("got reasons %v, want %v", reasons, want)
+	}
+	for i := range want {
+		if reasons[i] != want[i] {
+			t.Fatalf("got reasons %v, want %v", reasons, want)
+		}
+	}
+}
+
+func TestParseNixGenerations(t *testing.T) {
+	output := `
+   1   2026-04-01 10:00:00
+   2   2026-04-02 10:00:00   (current)
+`
+	generations, err := parseNixGenerations(output, "user", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(generations) != 2 {
+		t.Fatalf("got %d generations, want 2", len(generations))
+	}
+	if generations[1].Number != 2 || !generations[1].Current {
+		t.Fatalf("current generation not parsed correctly: %+v", generations[1])
+	}
+}
+
+func TestNixGenerationTargetsPreserveCurrentAndMinimum(t *testing.T) {
+	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
+	generations := []nixGeneration{
+		{Number: 1, CreatedAt: now.Add(-30 * 24 * time.Hour), Scope: "user"},
+		{Number: 2, CreatedAt: now.Add(-20 * 24 * time.Hour), Scope: "user"},
+		{Number: 3, CreatedAt: now.Add(-10 * 24 * time.Hour), Scope: "user"},
+		{Number: 4, CreatedAt: now.Add(-5 * 24 * time.Hour), Scope: "user", Current: true},
+		{Number: 5, CreatedAt: now.Add(-1 * 24 * time.Hour), Scope: "user"},
+	}
+
+	targets := nixGenerationTargets(generations, now, 3, 7*24*time.Hour)
+	actions := map[string]string{}
+	protected := map[string]bool{}
+	for _, target := range targets {
+		actions[target.Version] = target.Action
+		protected[target.Version] = target.Protected
+	}
+
+	if actions["1"] != "delete_generation" || protected["1"] {
+		t.Fatalf("expected generation 1 to be a deletion candidate, actions=%v protected=%v", actions, protected)
+	}
+	if actions["2"] != "delete_generation" || protected["2"] {
+		t.Fatalf("expected generation 2 to be a deletion candidate, actions=%v protected=%v", actions, protected)
+	}
+	for _, generation := range []string{"3", "4", "5"} {
+		if actions[generation] != "keep_generation" || !protected[generation] {
+			t.Fatalf("expected generation %s to be protected, actions=%v protected=%v", generation, actions, protected)
+		}
+	}
+}
