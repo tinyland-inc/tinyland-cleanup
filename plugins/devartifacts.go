@@ -19,7 +19,9 @@ import (
 )
 
 // DevArtifactsPlugin handles stale development artifact cleanup.
-type DevArtifactsPlugin struct{}
+type DevArtifactsPlugin struct {
+	activeProcesses func(context.Context) (map[string]string, error)
+}
 
 // NewDevArtifactsPlugin creates a new development artifact cleanup plugin.
 func NewDevArtifactsPlugin() *DevArtifactsPlugin {
@@ -61,6 +63,7 @@ func (p *DevArtifactsPlugin) PlanCleanup(ctx context.Context, level CleanupLevel
 		Steps: []string{
 			"Scan configured development workspaces for rebuildable artifact directories",
 			"Use project marker mtimes to classify stale node_modules, .venv, and Rust target directories",
+			"Protect artifact families when matching package manager, compiler, language server, or runtime processes are active",
 			"Honor configured protected paths before any deletion candidate is eligible",
 		},
 		Metadata: map[string]string{
@@ -72,6 +75,13 @@ func (p *DevArtifactsPlugin) PlanCleanup(ctx context.Context, level CleanupLevel
 		plan.Warnings = append(plan.Warnings, "warning level reports development artifacts only; moderate or higher is required for deletion")
 	}
 
+	active, activeErr := p.activeDevArtifactProcesses(ctx)
+	if activeErr != nil {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf("could not inspect active development processes: %v", activeErr))
+	} else if len(active) > 0 {
+		plan.Metadata["active_dev_artifacts"] = strings.Join(devArtifactActivityReasons(active), ", ")
+	}
+
 	var targets []CleanupTarget
 	for _, scanPath := range daCfg.ScanPaths {
 		expanded := expandHome(scanPath, home)
@@ -79,24 +89,24 @@ func (p *DevArtifactsPlugin) PlanCleanup(ctx context.Context, level CleanupLevel
 			continue
 		}
 		if daCfg.NodeModules {
-			p.planNodeModules(expanded, nodeAge, mutates, daCfg.ProtectPaths, &targets)
+			p.planNodeModules(expanded, nodeAge, mutates, daCfg.ProtectPaths, active, &targets)
 		}
 		if daCfg.PythonVenvs {
-			p.planPythonVenvs(expanded, venvAge, mutates, daCfg.ProtectPaths, &targets)
+			p.planPythonVenvs(expanded, venvAge, mutates, daCfg.ProtectPaths, active, &targets)
 		}
 		if daCfg.RustTargets {
-			p.planRustTargets(expanded, rustAge, mutates, daCfg.ProtectPaths, &targets)
+			p.planRustTargets(expanded, rustAge, mutates, daCfg.ProtectPaths, active, &targets)
 		}
 	}
 
 	if daCfg.GoBuildCache {
-		p.planGoBuildCache(ctx, level, &targets)
+		p.planGoBuildCache(ctx, level, active, &targets)
 	}
 	if daCfg.HaskellCache {
-		p.planHaskellCaches(home, level, &targets)
+		p.planHaskellCaches(home, level, active, &targets)
 	}
 	if daCfg.LMStudioModels {
-		p.planLMStudioModels(home, level, &targets)
+		p.planLMStudioModels(home, level, active, &targets)
 	}
 
 	sort.Slice(targets, func(i, j int) bool {
@@ -139,6 +149,12 @@ func (p *DevArtifactsPlugin) Cleanup(ctx context.Context, level CleanupLevel, cf
 		return result
 	}
 
+	active, activeErr := p.activeDevArtifactProcesses(ctx)
+	if activeErr != nil {
+		logger.Warn("skipping dev artifact cleanup because active process inspection failed", "error", activeErr)
+		return result
+	}
+
 	// Scan configured paths for dev artifacts
 	for _, scanPath := range daCfg.ScanPaths {
 		expanded := expandHome(scanPath, home)
@@ -146,7 +162,7 @@ func (p *DevArtifactsPlugin) Cleanup(ctx context.Context, level CleanupLevel, cf
 			continue
 		}
 
-		if daCfg.NodeModules {
+		if daCfg.NodeModules && !devArtifactFamilyActive(active, "node_modules") {
 			freed := p.cleanNodeModules(ctx, expanded, nodeAge, daCfg.ProtectPaths, logger)
 			result.BytesFreed += freed
 			if freed > 0 {
@@ -154,7 +170,7 @@ func (p *DevArtifactsPlugin) Cleanup(ctx context.Context, level CleanupLevel, cf
 			}
 		}
 
-		if daCfg.PythonVenvs {
+		if daCfg.PythonVenvs && !devArtifactFamilyActive(active, "python-venv") {
 			freed := p.cleanPythonVenvs(ctx, expanded, venvAge, daCfg.ProtectPaths, logger)
 			result.BytesFreed += freed
 			if freed > 0 {
@@ -162,7 +178,7 @@ func (p *DevArtifactsPlugin) Cleanup(ctx context.Context, level CleanupLevel, cf
 			}
 		}
 
-		if daCfg.RustTargets {
+		if daCfg.RustTargets && !devArtifactFamilyActive(active, "rust-target") {
 			freed := p.cleanRustTargets(ctx, expanded, rustAge, daCfg.ProtectPaths, logger)
 			result.BytesFreed += freed
 			if freed > 0 {
@@ -172,7 +188,7 @@ func (p *DevArtifactsPlugin) Cleanup(ctx context.Context, level CleanupLevel, cf
 	}
 
 	// Go build cache (not path-dependent - it's a global cache)
-	if daCfg.GoBuildCache {
+	if daCfg.GoBuildCache && !devArtifactFamilyActive(active, "go-build-cache") {
 		freed := p.cleanGoBuildCache(ctx, level, logger)
 		result.BytesFreed += freed
 		if freed > 0 {
@@ -181,7 +197,7 @@ func (p *DevArtifactsPlugin) Cleanup(ctx context.Context, level CleanupLevel, cf
 	}
 
 	// Haskell cache cleanup
-	if daCfg.HaskellCache {
+	if daCfg.HaskellCache && !devArtifactFamilyActive(active, "haskell-cache") {
 		freed := p.cleanHaskellCache(ctx, level, home, logger)
 		result.BytesFreed += freed
 		if freed > 0 {
@@ -190,7 +206,7 @@ func (p *DevArtifactsPlugin) Cleanup(ctx context.Context, level CleanupLevel, cf
 	}
 
 	// LM Studio models (opt-in only)
-	if daCfg.LMStudioModels {
+	if daCfg.LMStudioModels && !devArtifactFamilyActive(active, "lmstudio-models") {
 		freed := p.cleanLMStudioModels(ctx, level, home, logger)
 		result.BytesFreed += freed
 		if freed > 0 {
@@ -214,39 +230,44 @@ func devArtifactThresholds(level CleanupLevel) (nodeAge, venvAge, rustAge time.D
 	}
 }
 
-func (p *DevArtifactsPlugin) planNodeModules(scanPath string, maxAge time.Duration, mutates bool, protectPaths []string, targets *[]CleanupTarget) {
+func (p *DevArtifactsPlugin) planNodeModules(scanPath string, maxAge time.Duration, mutates bool, protectPaths []string, active map[string]string, targets *[]CleanupTarget) {
 	p.findArtifactDirs(scanPath, "node_modules", "package.json", func(dir string, size int64) {
 		marker := filepath.Join(filepath.Dir(dir), "package.json")
 		stale := maxAge == 0 || p.isFileStale(marker, maxAge)
-		*targets = append(*targets, p.devArtifactTarget("node_modules", "node_modules", dir, size, stale, mutates, p.isProtected(dir, protectPaths), "package.json", maxAge))
+		*targets = append(*targets, p.devArtifactTarget("node_modules", "node_modules", dir, size, stale, mutates, p.isProtected(dir, protectPaths), "package.json", maxAge, active))
 	})
 }
 
-func (p *DevArtifactsPlugin) planPythonVenvs(scanPath string, maxAge time.Duration, mutates bool, protectPaths []string, targets *[]CleanupTarget) {
+func (p *DevArtifactsPlugin) planPythonVenvs(scanPath string, maxAge time.Duration, mutates bool, protectPaths []string, active map[string]string, targets *[]CleanupTarget) {
 	markers := []string{"pyproject.toml", "setup.py", "requirements.txt"}
 	p.findArtifactDirs(scanPath, ".venv", "", func(dir string, size int64) {
 		stale := maxAge == 0 || p.pythonProjectStale(filepath.Dir(dir), markers, maxAge)
-		*targets = append(*targets, p.devArtifactTarget("python-venv", ".venv", dir, size, stale, mutates, p.isProtected(dir, protectPaths), strings.Join(markers, ", "), maxAge))
+		*targets = append(*targets, p.devArtifactTarget("python-venv", ".venv", dir, size, stale, mutates, p.isProtected(dir, protectPaths), strings.Join(markers, ", "), maxAge, active))
 	})
 }
 
-func (p *DevArtifactsPlugin) planRustTargets(scanPath string, maxAge time.Duration, mutates bool, protectPaths []string, targets *[]CleanupTarget) {
+func (p *DevArtifactsPlugin) planRustTargets(scanPath string, maxAge time.Duration, mutates bool, protectPaths []string, active map[string]string, targets *[]CleanupTarget) {
 	p.findArtifactDirs(scanPath, "target", "Cargo.toml", func(dir string, size int64) {
 		marker := filepath.Join(filepath.Dir(dir), "Cargo.toml")
 		stale := maxAge == 0 || p.isFileStale(marker, maxAge)
-		*targets = append(*targets, p.devArtifactTarget("rust-target", "target", dir, size, stale, mutates, p.isProtected(dir, protectPaths), "Cargo.toml", maxAge))
+		*targets = append(*targets, p.devArtifactTarget("rust-target", "target", dir, size, stale, mutates, p.isProtected(dir, protectPaths), "Cargo.toml", maxAge, active))
 	})
 }
 
-func (p *DevArtifactsPlugin) devArtifactTarget(targetType, name, path string, bytes int64, stale, mutates, protected bool, marker string, maxAge time.Duration) CleanupTarget {
+func (p *DevArtifactsPlugin) devArtifactTarget(targetType, name, path string, bytes int64, stale, mutates, protected bool, marker string, maxAge time.Duration, active map[string]string) CleanupTarget {
+	activeReason, isActive := active[targetType]
 	target := CleanupTarget{
 		Type:      targetType,
 		Name:      name,
 		Path:      path,
 		Bytes:     bytes,
-		Protected: protected || !stale,
+		Active:    isActive,
+		Protected: isActive || protected || !stale,
 	}
 	switch {
+	case isActive:
+		target.Action = "protect"
+		target.Reason = "active development process detected: " + activeReason
 	case protected:
 		target.Action = "protect"
 		target.Reason = "path is covered by dev_artifacts.protect_paths"
@@ -273,7 +294,7 @@ func (p *DevArtifactsPlugin) pythonProjectStale(parentDir string, markers []stri
 	return true
 }
 
-func (p *DevArtifactsPlugin) planGoBuildCache(ctx context.Context, level CleanupLevel, targets *[]CleanupTarget) {
+func (p *DevArtifactsPlugin) planGoBuildCache(ctx context.Context, level CleanupLevel, active map[string]string, targets *[]CleanupTarget) {
 	dir := p.getGoCacheDir(ctx)
 	if dir == "" || !pathExistsAndIsDir(dir) {
 		return
@@ -287,6 +308,14 @@ func (p *DevArtifactsPlugin) planGoBuildCache(ctx context.Context, level Cleanup
 		Name:  "GOCACHE",
 		Path:  dir,
 		Bytes: size,
+	}
+	if activeReason, ok := active["go-build-cache"]; ok {
+		target.Action = "protect"
+		target.Active = true
+		target.Protected = true
+		target.Reason = "active development process detected: " + activeReason
+		*targets = append(*targets, target)
+		return
 	}
 	switch level {
 	case LevelModerate:
@@ -304,7 +333,7 @@ func (p *DevArtifactsPlugin) planGoBuildCache(ctx context.Context, level Cleanup
 	*targets = append(*targets, target)
 }
 
-func (p *DevArtifactsPlugin) planHaskellCaches(home string, level CleanupLevel, targets *[]CleanupTarget) {
+func (p *DevArtifactsPlugin) planHaskellCaches(home string, level CleanupLevel, active map[string]string, targets *[]CleanupTarget) {
 	ghcupCache := filepath.Join(home, ".ghcup", "cache")
 	if pathExistsAndIsDir(ghcupCache) {
 		target := CleanupTarget{
@@ -313,15 +342,22 @@ func (p *DevArtifactsPlugin) planHaskellCaches(home string, level CleanupLevel, 
 			Path:  ghcupCache,
 			Bytes: getDirAllocatedBytes(ghcupCache),
 		}
-		if level >= LevelModerate {
+		if activeReason, ok := active["haskell-cache"]; ok {
+			target.Action = "protect"
+			target.Active = true
+			target.Protected = true
+			target.Reason = "active development process detected: " + activeReason
+			*targets = append(*targets, target)
+		} else if level >= LevelModerate {
 			target.Action = "delete"
 			target.Reason = ".ghcup/cache contains rebuildable/downloadable artifacts"
+			*targets = append(*targets, target)
 		} else {
 			target.Action = "report"
 			target.Protected = true
 			target.Reason = "warning level reports Haskell caches without deleting them"
+			*targets = append(*targets, target)
 		}
-		*targets = append(*targets, target)
 	}
 
 	cabalStore := filepath.Join(home, ".cabal", "store")
@@ -331,6 +367,14 @@ func (p *DevArtifactsPlugin) planHaskellCaches(home string, level CleanupLevel, 
 			Name:  ".cabal/store",
 			Path:  cabalStore,
 			Bytes: getDirAllocatedBytes(cabalStore),
+		}
+		if activeReason, ok := active["haskell-cache"]; ok {
+			target.Action = "protect"
+			target.Active = true
+			target.Protected = true
+			target.Reason = "active development process detected: " + activeReason
+			*targets = append(*targets, target)
+			return
 		}
 		if level >= LevelAggressive {
 			target.Action = "clean-stale-files"
@@ -344,7 +388,7 @@ func (p *DevArtifactsPlugin) planHaskellCaches(home string, level CleanupLevel, 
 	}
 }
 
-func (p *DevArtifactsPlugin) planLMStudioModels(home string, level CleanupLevel, targets *[]CleanupTarget) {
+func (p *DevArtifactsPlugin) planLMStudioModels(home string, level CleanupLevel, active map[string]string, targets *[]CleanupTarget) {
 	dir := filepath.Join(home, ".lmstudio", "models")
 	if !pathExistsAndIsDir(dir) {
 		return
@@ -355,6 +399,14 @@ func (p *DevArtifactsPlugin) planLMStudioModels(home string, level CleanupLevel,
 		Path:  dir,
 		Bytes: getDirAllocatedBytes(dir),
 	}
+	if activeReason, ok := active["lmstudio-models"]; ok {
+		target.Action = "protect"
+		target.Active = true
+		target.Protected = true
+		target.Reason = "active development process detected: " + activeReason
+		*targets = append(*targets, target)
+		return
+	}
 	if level >= LevelCritical {
 		target.Action = "clean-stale-files"
 		target.Reason = "critical level deletes LM Studio model files older than 30 days"
@@ -364,6 +416,89 @@ func (p *DevArtifactsPlugin) planLMStudioModels(home string, level CleanupLevel,
 		target.Reason = "LM Studio model cleanup is opt-in and reports until critical"
 	}
 	*targets = append(*targets, target)
+}
+
+func (p *DevArtifactsPlugin) activeDevArtifactProcesses(ctx context.Context) (map[string]string, error) {
+	if p.activeProcesses != nil {
+		return p.activeProcesses(ctx)
+	}
+
+	psCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(psCtx, "ps", "-axo", "comm=,args=")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return devArtifactBusyProcessReasons(string(output)), nil
+}
+
+func devArtifactBusyProcessReasons(output string) map[string]string {
+	active := map[string]string{}
+	add := func(targetType, reason string) {
+		if _, ok := active[targetType]; !ok {
+			active[targetType] = reason
+		}
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.ToLower(line))
+		if len(fields) == 0 {
+			continue
+		}
+		command := filepath.Base(fields[0])
+		arg0 := command
+		if len(fields) > 1 {
+			arg0 = filepath.Base(fields[1])
+		}
+		normalized := strings.Join(fields, " ")
+
+		switch {
+		case command == "npm" || command == "pnpm" || command == "yarn" || command == "bun" ||
+			arg0 == "npm" || arg0 == "pnpm" || arg0 == "yarn" || arg0 == "bun" ||
+			command == "node" || arg0 == "node":
+			add("node_modules", "Node.js package manager or runtime")
+		case command == "python" || command == "python3" || command == "pip" || command == "pip3" ||
+			command == "uv" || command == "poetry" || command == "pytest" ||
+			arg0 == "python" || arg0 == "python3" || arg0 == "pip" || arg0 == "pip3" ||
+			arg0 == "uv" || arg0 == "poetry" || arg0 == "pytest":
+			add("python-venv", "Python toolchain process")
+		case command == "cargo" || command == "rustc" || command == "rust-analyzer" ||
+			arg0 == "cargo" || arg0 == "rustc" || arg0 == "rust-analyzer":
+			add("rust-target", "Rust toolchain process")
+		case (command == "go" || arg0 == "go") &&
+			(strings.Contains(normalized, " go build") ||
+				strings.Contains(normalized, " go test") ||
+				strings.Contains(normalized, " go run") ||
+				strings.Contains(normalized, " go install") ||
+				strings.Contains(normalized, " go clean") ||
+				strings.Contains(normalized, " go work")):
+			add("go-build-cache", "Go toolchain process")
+		case command == "gopls" || arg0 == "gopls":
+			add("go-build-cache", "Go language server process")
+		case command == "cabal" || command == "stack" || command == "ghcup" || command == "ghc" ||
+			arg0 == "cabal" || arg0 == "stack" || arg0 == "ghcup" || arg0 == "ghc":
+			add("haskell-cache", "Haskell toolchain process")
+		case strings.Contains(normalized, "lm studio") || strings.Contains(normalized, "lmstudio"):
+			add("lmstudio-models", "LM Studio process")
+		}
+	}
+	return active
+}
+
+func devArtifactActivityReasons(active map[string]string) []string {
+	reasons := make([]string, 0, len(active))
+	for targetType, reason := range active {
+		reasons = append(reasons, targetType+": "+reason)
+	}
+	sort.Strings(reasons)
+	return reasons
+}
+
+func devArtifactFamilyActive(active map[string]string, targetType string) bool {
+	_, ok := active[targetType]
+	return ok
 }
 
 func formatDevArtifactAge(maxAge time.Duration) string {

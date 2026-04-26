@@ -276,7 +276,7 @@ func TestCleanupWarningLevel(t *testing.T) {
 }
 
 func TestPlanCleanupWarningReportsDevArtifacts(t *testing.T) {
-	p := NewDevArtifactsPlugin()
+	p := newDevArtifactsPluginWithActive(nil)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	tmpDir := t.TempDir()
 	project := filepath.Join(tmpDir, "old-project")
@@ -308,7 +308,7 @@ func TestPlanCleanupWarningReportsDevArtifacts(t *testing.T) {
 }
 
 func TestPlanCleanupModerateClassifiesDevArtifacts(t *testing.T) {
-	p := NewDevArtifactsPlugin()
+	p := newDevArtifactsPluginWithActive(nil)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	tmpDir := t.TempDir()
 
@@ -361,6 +361,81 @@ func TestPlanCleanupModerateClassifiesDevArtifacts(t *testing.T) {
 	}
 }
 
+func TestPlanNodeModulesProtectsActiveDevelopmentProcess(t *testing.T) {
+	p := NewDevArtifactsPlugin()
+	tmpDir := t.TempDir()
+	project := filepath.Join(tmpDir, "active-project")
+	if err := os.MkdirAll(filepath.Join(project, "node_modules", "pkg"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "node_modules", "pkg", "index.js"), []byte("module.exports = {}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	packageJSON := filepath.Join(project, "package.json")
+	if err := os.WriteFile(packageJSON, []byte(`{"name":"active"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-60 * 24 * time.Hour)
+	if err := os.Chtimes(packageJSON, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	var targets []CleanupTarget
+	p.planNodeModules(tmpDir, 30*24*time.Hour, true, nil, map[string]string{
+		"node_modules": "Node.js package manager or runtime",
+	}, &targets)
+
+	target := findDevArtifactTarget(t, targets, "node_modules", filepath.Join(project, "node_modules"))
+	if target.Action != "protect" || !target.Protected || !target.Active {
+		t.Fatalf("expected active node_modules to be protected, got %#v", target)
+	}
+}
+
+func TestDevArtifactBusyProcessReasons(t *testing.T) {
+	ps := `
+/nix/store/node/bin/node node vite dev
+/nix/store/uv/bin/uv uv pip install -r requirements.txt
+/nix/store/rust/bin/cargo cargo build
+/nix/store/go/bin/go go test ./...
+/nix/store/cabal/bin/cabal cabal build all
+/Applications/LM Studio.app/Contents/MacOS/LM Studio
+`
+	active := devArtifactBusyProcessReasons(ps)
+
+	want := map[string]string{
+		"node_modules":    "Node.js package manager or runtime",
+		"python-venv":     "Python toolchain process",
+		"rust-target":     "Rust toolchain process",
+		"go-build-cache":  "Go toolchain process",
+		"haskell-cache":   "Haskell toolchain process",
+		"lmstudio-models": "LM Studio process",
+	}
+	for targetType, reason := range want {
+		if active[targetType] != reason {
+			t.Fatalf("active[%s] = %q, want %q; active=%#v", targetType, active[targetType], reason, active)
+		}
+	}
+}
+
+func TestDevArtifactActivityReasonsSorted(t *testing.T) {
+	reasons := devArtifactActivityReasons(map[string]string{
+		"rust-target":  "Rust toolchain process",
+		"node_modules": "Node.js package manager or runtime",
+	})
+	want := []string{
+		"node_modules: Node.js package manager or runtime",
+		"rust-target: Rust toolchain process",
+	}
+	if len(reasons) != len(want) {
+		t.Fatalf("got reasons %#v, want %#v", reasons, want)
+	}
+	for idx := range want {
+		if reasons[idx] != want[idx] {
+			t.Fatalf("got reasons %#v, want %#v", reasons, want)
+		}
+	}
+}
+
 func TestGetGoCacheDir(t *testing.T) {
 	p := NewDevArtifactsPlugin()
 
@@ -386,4 +461,12 @@ func findDevArtifactTarget(t *testing.T, targets []CleanupTarget, targetType, pa
 	}
 	t.Fatalf("target %s at %s not found in %#v", targetType, path, targets)
 	return CleanupTarget{}
+}
+
+func newDevArtifactsPluginWithActive(active map[string]string) *DevArtifactsPlugin {
+	return &DevArtifactsPlugin{
+		activeProcesses: func(context.Context) (map[string]string, error) {
+			return active, nil
+		},
+	}
 }
