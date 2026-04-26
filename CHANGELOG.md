@@ -47,6 +47,8 @@ All notable changes to this project will be documented in this file.
   configured budget.
 - Active-process protection for development artifact cleanup families such as
   Node.js, Python, Rust, Go, Haskell, and LM Studio.
+- Typed Darwin developer-cache targets for VS Code and Cursor cache-only
+  directories, with active-editor protection.
 
 ### Changed
 

@@ -127,6 +127,16 @@ darwin_dev_caches:
   pip:
     enabled: true
     stale_after_days: 14
+  vscode:
+    enabled: true
+    max_gb: 4
+    stale_after_days: 14
+    keep_active_versions: true
+  cursor:
+    enabled: true
+    max_gb: 4
+    stale_after_days: 14
+    keep_active_versions: true
 
 # Lima VM settings (macOS)
 lima:

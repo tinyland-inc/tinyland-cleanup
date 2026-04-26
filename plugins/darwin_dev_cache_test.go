@@ -106,6 +106,41 @@ func TestDarwinDeveloperCacheTargetsOptInEnforcement(t *testing.T) {
 	}
 }
 
+func TestDarwinDeveloperCacheTargetsEditorCaches(t *testing.T) {
+	home := t.TempDir()
+	cfg := config.DefaultConfig().DarwinDevCaches
+	cfg.Enforce = true
+
+	vscodeCache := filepath.Join(home, "Library/Application Support/Code/Cache")
+	vscodeSettings := filepath.Join(home, "Library/Application Support/Code/User/settings.json")
+	cursorCache := filepath.Join(home, "Library/Application Support/Cursor/Cache")
+	writeCacheFile(t, home, "Library/Application Support/Code/Cache/cache.bin", "vscode")
+	writeCacheFile(t, home, "Library/Application Support/Code/User/settings.json", "{}")
+	writeCacheFile(t, home, "Library/Application Support/Cursor/Cache/cache.bin", "cursor")
+
+	oldTime := time.Now().Add(-30 * 24 * time.Hour)
+	mustChtimes(t, vscodeCache, oldTime)
+	mustChtimes(t, cursorCache, oldTime)
+
+	plugin := &CachePlugin{}
+	targets := plugin.darwinDeveloperCacheTargets(home, cfg, map[string]bool{"code helper": true}, LevelModerate)
+
+	vscode := findCleanupTarget(t, targets, "vscode-cache", "Code/Cache")
+	if !vscode.Active || !vscode.Protected || vscode.Action != "protect" {
+		t.Fatalf("expected active VS Code cache to be protected: %#v", vscode)
+	}
+	cursor := findCleanupTarget(t, targets, "cursor-cache", "Cursor/Cache")
+	if cursor.Active || cursor.Protected || cursor.Action != "delete" {
+		t.Fatalf("expected inactive stale Cursor cache to be an opt-in delete target: %#v", cursor)
+	}
+	if _, ok := findCleanupTargetMaybe(targets, "vscode-cache", "Code/User"); ok {
+		t.Fatalf("editor settings directory should not be emitted as a cache target")
+	}
+	if _, err := os.Stat(vscodeSettings); err != nil {
+		t.Fatalf("test settings fixture should exist: %v", err)
+	}
+}
+
 func TestCleanupDarwinDeveloperCacheTargetsDeletesOnlyEligibleTargets(t *testing.T) {
 	home := t.TempDir()
 	cfg := config.DefaultConfig().DarwinDevCaches
@@ -164,11 +199,19 @@ func nilLogger() *slog.Logger {
 
 func findCleanupTarget(t *testing.T, targets []CleanupTarget, targetType, name string) CleanupTarget {
 	t.Helper()
-	for _, target := range targets {
-		if target.Type == targetType && target.Name == name {
-			return target
-		}
+	target, ok := findCleanupTargetMaybe(targets, targetType, name)
+	if ok {
+		return target
 	}
 	t.Fatalf("target %s/%s not found in %#v", targetType, name, targets)
 	return CleanupTarget{}
+}
+
+func findCleanupTargetMaybe(targets []CleanupTarget, targetType, name string) (CleanupTarget, bool) {
+	for _, target := range targets {
+		if target.Type == targetType && target.Name == name {
+			return target, true
+		}
+	}
+	return CleanupTarget{}, false
 }

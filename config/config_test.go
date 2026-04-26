@@ -335,6 +335,24 @@ func TestDarwinDevCacheDefaults(t *testing.T) {
 	if cfg.DarwinDevCaches.Bazelisk.KeepLatest != 2 {
 		t.Errorf("DarwinDevCaches.Bazelisk.KeepLatest should default to 2, got %d", cfg.DarwinDevCaches.Bazelisk.KeepLatest)
 	}
+	if !cfg.DarwinDevCaches.VSCode.Enabled {
+		t.Error("DarwinDevCaches.VSCode.Enabled should default to true")
+	}
+	if cfg.DarwinDevCaches.VSCode.StaleAfterDays != 14 {
+		t.Errorf("DarwinDevCaches.VSCode.StaleAfterDays should default to 14, got %d", cfg.DarwinDevCaches.VSCode.StaleAfterDays)
+	}
+	if !cfg.DarwinDevCaches.VSCode.KeepActiveVersions {
+		t.Error("DarwinDevCaches.VSCode.KeepActiveVersions should default to true")
+	}
+	if !cfg.DarwinDevCaches.Cursor.Enabled {
+		t.Error("DarwinDevCaches.Cursor.Enabled should default to true")
+	}
+	if cfg.DarwinDevCaches.Cursor.StaleAfterDays != 14 {
+		t.Errorf("DarwinDevCaches.Cursor.StaleAfterDays should default to 14, got %d", cfg.DarwinDevCaches.Cursor.StaleAfterDays)
+	}
+	if !cfg.DarwinDevCaches.Cursor.KeepActiveVersions {
+		t.Error("DarwinDevCaches.Cursor.KeepActiveVersions should default to true")
+	}
 }
 
 func TestLoadConfigWithNewFields(t *testing.T) {
@@ -411,6 +429,13 @@ darwin_dev_caches:
   pip:
     enabled: true
     stale_after_days: 7
+  vscode:
+    enabled: true
+    stale_after_days: 10
+    keep_active_versions: false
+  cursor:
+    enabled: false
+    stale_after_days: 5
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatal(err)
@@ -546,5 +571,17 @@ darwin_dev_caches:
 	}
 	if cfg.DarwinDevCaches.Pip.StaleAfterDays != 7 {
 		t.Errorf("DarwinDevCaches.Pip.StaleAfterDays should be 7 per config, got %d", cfg.DarwinDevCaches.Pip.StaleAfterDays)
+	}
+	if cfg.DarwinDevCaches.VSCode.StaleAfterDays != 10 {
+		t.Errorf("DarwinDevCaches.VSCode.StaleAfterDays should be 10 per config, got %d", cfg.DarwinDevCaches.VSCode.StaleAfterDays)
+	}
+	if cfg.DarwinDevCaches.VSCode.KeepActiveVersions {
+		t.Error("DarwinDevCaches.VSCode.KeepActiveVersions should be false per config")
+	}
+	if cfg.DarwinDevCaches.Cursor.Enabled {
+		t.Error("DarwinDevCaches.Cursor.Enabled should be false per config")
+	}
+	if cfg.DarwinDevCaches.Cursor.StaleAfterDays != 5 {
+		t.Errorf("DarwinDevCaches.Cursor.StaleAfterDays should be 5 per config, got %d", cfg.DarwinDevCaches.Cursor.StaleAfterDays)
 	}
 }

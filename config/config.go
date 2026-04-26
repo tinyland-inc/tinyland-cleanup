@@ -273,6 +273,10 @@ type DarwinDevCachesConfig struct {
 	Bazelisk DarwinDevCacheToolConfig `yaml:"bazelisk"`
 	// Pip controls pip cache planning.
 	Pip DarwinDevCacheToolConfig `yaml:"pip"`
+	// VSCode controls Visual Studio Code cache planning.
+	VSCode DarwinDevCacheToolConfig `yaml:"vscode"`
+	// Cursor controls Cursor cache planning.
+	Cursor DarwinDevCacheToolConfig `yaml:"cursor"`
 }
 
 // DarwinDevCacheToolConfig holds per-tool cache budget settings.
@@ -435,6 +439,18 @@ func DefaultConfig() *Config {
 			Pip: DarwinDevCacheToolConfig{
 				Enabled:        true,
 				StaleAfterDays: 14,
+			},
+			VSCode: DarwinDevCacheToolConfig{
+				Enabled:            true,
+				MaxGB:              4,
+				StaleAfterDays:     14,
+				KeepActiveVersions: true,
+			},
+			Cursor: DarwinDevCacheToolConfig{
+				Enabled:            true,
+				MaxGB:              4,
+				StaleAfterDays:     14,
+				KeepActiveVersions: true,
 			},
 		},
 		APFS: APFSConfig{

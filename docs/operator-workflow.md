@@ -94,6 +94,9 @@ space.
 For Darwin IDE and tool caches, review
 [darwin-dev-caches.md](darwin-dev-caches.md). These targets are reported for
 operator review, and real deletion requires `darwin_dev_caches.enforce: true`.
+The typed surface covers cache-only JetBrains, Playwright, Bazelisk, pip, VS
+Code, and Cursor targets while preserving settings, extension data, credentials,
+and active editor or IDE processes.
 
 For workspace build artifacts, the `dev-artifacts` plan reports rebuildable
 targets such as `node_modules`, Python virtualenvs, Rust `target/` directories,
