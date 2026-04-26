@@ -7,6 +7,16 @@ Use this workflow when a developer machine or runner is under disk pressure.
 Start with a dry-run at the pressure level you are considering:
 
 ```sh
+tinyland-cleanup --once --dry-run --level critical --output text
+```
+
+The text report is the operator explain view. It summarizes the selected level,
+monitored mounts, host free-space accounting, target free-space deficit, plugin
+plans, warnings, and the first few cleanup targets for review.
+
+Use JSON when another tool needs the stable report schema:
+
+```sh
 tinyland-cleanup --once --dry-run --level critical --output json
 ```
 
@@ -32,10 +42,10 @@ level during a real cleanup cycle.
 After reviewing the plan, run the same level without `--dry-run`:
 
 ```sh
-tinyland-cleanup --once --level critical --output json
+tinyland-cleanup --once --level critical --output text
 ```
 
-The report distinguishes:
+Use `--output json` for automation. The report distinguishes:
 
 - `bytes_freed`: the legacy aggregate byte count reported by the plugin;
 - `estimated_bytes_freed`: bytes based on local size estimates, when a plugin

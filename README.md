@@ -52,6 +52,12 @@ BAZEL_REMOTE_CACHE=grpc://bazel-cache.nix-cache.svc.cluster.local:9092 \
 Review the cleanup plan before mutating a high-pressure machine:
 
 ```sh
+tinyland-cleanup --once --dry-run --level critical --output text
+```
+
+Use JSON when another tool needs the stable report schema:
+
+```sh
 tinyland-cleanup --once --dry-run --level critical --output json
 ```
 

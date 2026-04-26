@@ -27,6 +27,7 @@ go_library(
     name = "tinyland-cleanup_lib",
     srcs = [
         "main.go",
+        "report_text.go",
         "state.go",
     ] + select({
         "@platforms//os:macos": ["plugins_darwin.go"],

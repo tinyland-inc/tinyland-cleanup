@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,6 +106,53 @@ func TestRunOnceDryRunJSONReportIncludesPluginPlan(t *testing.T) {
 	}
 	if report.PlannedTargets != 2 {
 		t.Fatalf("expected 2 planned targets, got %d", report.PlannedTargets)
+	}
+}
+
+func TestRunOnceDryRunTextReportExplainsPlan(t *testing.T) {
+	var output bytes.Buffer
+	mock := &planningPlugin{
+		reportingPlugin: reportingPlugin{},
+		plan: plugins.CleanupPlan{
+			Plugin:              "reporting",
+			Level:               "critical",
+			Summary:             "reporting dry-run plan",
+			WouldRun:            true,
+			EstimatedBytesFreed: 1024 * 1024,
+			Targets: []plugins.CleanupTarget{
+				{
+					Type:      "cache",
+					Name:      "example-cache",
+					Bytes:     1024,
+					Protected: true,
+					Action:    "review",
+					Reason:    "operator review required",
+				},
+			},
+			Warnings: []string{"review before cleanup"},
+		},
+	}
+	daemon := newTestDaemon(t, mock, &output)
+	daemon.dryRun = true
+	daemon.output = "text"
+
+	if err := daemon.runOnce(context.Background(), monitor.LevelCritical); err != nil {
+		t.Fatalf("runOnce failed: %v", err)
+	}
+
+	text := output.String()
+	for _, want := range []string{
+		"tinyland-cleanup dry-run report",
+		"level: critical (forced)",
+		"plan: estimated reclaim 1.0 MiB",
+		"- reporting: would run (dry_run)",
+		"reporting dry-run plan",
+		"example-cache [cache]: review, protected, 1.0 KiB - operator review required",
+		"review before cleanup",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("text report missing %q:\n%s", want, text)
+		}
 	}
 }
 
