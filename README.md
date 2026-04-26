@@ -61,6 +61,12 @@ Use JSON when another tool needs the stable report schema:
 tinyland-cleanup --once --dry-run --level critical --output json
 ```
 
+Constrain review to specific plugins before scanning broad cache surfaces:
+
+```sh
+tinyland-cleanup --once --dry-run --level critical --plugins bazel,nix --output text
+```
+
 For a one-off run, override the configured maximum used-space target without
 editing the config file:
 

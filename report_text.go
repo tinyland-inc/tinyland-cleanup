@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/Jesssullivan/tinyland-cleanup/monitor"
 	"github.com/Jesssullivan/tinyland-cleanup/plugins"
@@ -36,6 +37,11 @@ func writeTextReport(w io.Writer, report cycleReport) error {
 
 	if report.MonitorPath != "" {
 		if _, err := fmt.Fprintf(w, "monitor: %s\n", report.MonitorPath); err != nil {
+			return err
+		}
+	}
+	if len(report.PluginFilter) > 0 {
+		if _, err := fmt.Fprintf(w, "plugin filter: %s\n", strings.Join(report.PluginFilter, ", ")); err != nil {
 			return err
 		}
 	}
