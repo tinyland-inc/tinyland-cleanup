@@ -28,6 +28,12 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Thresholds.Critical != 95 {
 		t.Errorf("expected Critical=95, got %d", cfg.Thresholds.Critical)
 	}
+	if cfg.Policy.Cooldown != "30m" {
+		t.Errorf("expected cooldown=30m, got %q", cfg.Policy.Cooldown)
+	}
+	if cfg.Policy.StateFile == "" {
+		t.Error("expected default state file")
+	}
 
 	// Test enable flags
 	if !cfg.Enable.Cache {

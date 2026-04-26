@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -129,6 +130,7 @@ func main() {
 		output:    *output,
 		report:    os.Stdout,
 		diskStats: monitor.GetDiskStats,
+		now:       time.Now,
 	}
 
 	// Determine operation mode
@@ -187,6 +189,7 @@ type daemon struct {
 	output    string
 	report    io.Writer
 	diskStats func(path string) (*monitor.DiskStats, error)
+	now       func() time.Time
 }
 
 func (d *daemon) run(ctx context.Context) error {
@@ -218,14 +221,27 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 		level = assessment.Level
 	}
 
+	now := d.currentTime()
 	report := cycleReport{
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		Timestamp:   now.UTC().Format(time.RFC3339),
 		DryRun:      d.dryRun,
 		ForcedLevel: forcedLevel != monitor.LevelNone,
 		Level:       level.String(),
 		MonitorPath: d.primaryMonitorPath(assessment),
 		Mounts:      assessment.Mounts,
 	}
+
+	cooldown := d.cleanupCooldown()
+	if cooldown > 0 {
+		report.CooldownSeconds = int64(cooldown / time.Second)
+	}
+	report.StateFile = expandPathHome(d.config.Policy.StateFile)
+	state, stateErr := d.loadStateForCycle()
+	if stateErr != nil {
+		report.StateError = stateErr.Error()
+		d.logger.Warn("failed to load cleanup state", "path", report.StateFile, "error", stateErr)
+	}
+	stateDirty := false
 
 	beforeStats, beforeErr := d.getDiskStats(report.MonitorPath)
 	if beforeErr != nil {
@@ -268,6 +284,16 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 			continue
 		}
 
+		if d.shouldApplyCooldown(report, level) && stateErr == nil {
+			if remaining := state.cooldownRemaining(p.Name(), pluginLevel, now, cooldown); remaining > 0 {
+				pluginReport.WouldRun = false
+				pluginReport.SkipReason = "cooldown"
+				pluginReport.CooldownRemainingSeconds = int64(remaining.Round(time.Second) / time.Second)
+				report.Plugins = append(report.Plugins, pluginReport)
+				continue
+			}
+		}
+
 		if d.dryRun {
 			if planner, ok := p.(plugins.Planner); ok {
 				plan := planner.PlanCleanup(ctx, pluginLevel, d.config, d.logger)
@@ -298,10 +324,18 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 			pluginReport.Error = result.Error.Error()
 			report.Plugins = append(report.Plugins, pluginReport)
 			d.logger.Error("plugin failed", "plugin", p.Name(), "error", result.Error)
+			if stateErr == nil {
+				state.recordPluginRun(p.Name(), pluginLevel, now, result)
+				stateDirty = true
+			}
 			continue
 		}
 
 		report.Plugins = append(report.Plugins, pluginReport)
+		if stateErr == nil {
+			state.recordPluginRun(p.Name(), pluginLevel, now, result)
+			stateDirty = true
+		}
 		if result.BytesFreed > 0 || result.ItemsCleaned > 0 {
 			d.logger.Info("plugin completed",
 				"plugin", p.Name(),
@@ -319,6 +353,12 @@ func (d *daemon) runOnce(ctx context.Context, forcedLevel monitor.CleanupLevel) 
 	report.TotalItemsCleaned = totalItems
 
 	d.updateHostFreeAfter(&report, beforeStats, beforeErr)
+	if stateDirty {
+		if err := saveCleanupState(report.StateFile, state); err != nil {
+			report.StateError = err.Error()
+			d.logger.Warn("failed to save cleanup state", "path", report.StateFile, "error", err)
+		}
+	}
 
 	d.logger.Info("cleanup cycle host free-space",
 		"path", report.MonitorPath,
@@ -348,6 +388,9 @@ type cycleReport struct {
 	HostFreeAfterBytes  uint64 `json:"host_free_after_bytes"`
 	HostFreeDeltaBytes  int64  `json:"host_free_delta_bytes"`
 	HostFreeError       string `json:"host_free_error,omitempty"`
+	StateFile           string `json:"state_file,omitempty"`
+	StateError          string `json:"state_error,omitempty"`
+	CooldownSeconds     int64  `json:"cooldown_seconds,omitempty"`
 	// TargetUsedPercent is the legacy target_free config value as a maximum used percentage.
 	TargetUsedPercent int `json:"target_used_percent"`
 	// TargetFreeBytes is the free-space equivalent required to satisfy TargetUsedPercent.
@@ -381,19 +424,20 @@ type mountReport struct {
 }
 
 type pluginCycleReport struct {
-	Name                string               `json:"name"`
-	Description         string               `json:"description"`
-	Level               string               `json:"level"`
-	DryRun              bool                 `json:"dry_run"`
-	WouldRun            bool                 `json:"would_run"`
-	SkipReason          string               `json:"skip_reason,omitempty"`
-	Plan                *plugins.CleanupPlan `json:"plan,omitempty"`
-	BytesFreed          int64                `json:"bytes_freed"`
-	EstimatedBytesFreed int64                `json:"estimated_bytes_freed"`
-	CommandBytesFreed   int64                `json:"command_bytes_freed"`
-	HostBytesFreed      int64                `json:"host_bytes_freed"`
-	ItemsCleaned        int                  `json:"items_cleaned"`
-	Error               string               `json:"error,omitempty"`
+	Name                     string               `json:"name"`
+	Description              string               `json:"description"`
+	Level                    string               `json:"level"`
+	DryRun                   bool                 `json:"dry_run"`
+	WouldRun                 bool                 `json:"would_run"`
+	SkipReason               string               `json:"skip_reason,omitempty"`
+	Plan                     *plugins.CleanupPlan `json:"plan,omitempty"`
+	BytesFreed               int64                `json:"bytes_freed"`
+	EstimatedBytesFreed      int64                `json:"estimated_bytes_freed"`
+	CommandBytesFreed        int64                `json:"command_bytes_freed"`
+	HostBytesFreed           int64                `json:"host_bytes_freed"`
+	ItemsCleaned             int                  `json:"items_cleaned"`
+	CooldownRemainingSeconds int64                `json:"cooldown_remaining_seconds,omitempty"`
+	Error                    string               `json:"error,omitempty"`
 }
 
 type mountAssessment struct {
@@ -544,6 +588,38 @@ func (d *daemon) getDiskStats(path string) (*monitor.DiskStats, error) {
 	return monitor.GetDiskStats(path)
 }
 
+func (d *daemon) currentTime() time.Time {
+	if d.now != nil {
+		return d.now()
+	}
+	return time.Now()
+}
+
+func (d *daemon) cleanupCooldown() time.Duration {
+	if d.config == nil || d.config.Policy.Cooldown == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(d.config.Policy.Cooldown)
+	if err != nil || duration < 0 {
+		return 0
+	}
+	return duration
+}
+
+func (d *daemon) loadStateForCycle() (*cleanupState, error) {
+	if d.dryRun || d.config == nil {
+		return newCleanupState(), nil
+	}
+	return loadCleanupState(expandPathHome(d.config.Policy.StateFile))
+}
+
+func (d *daemon) shouldApplyCooldown(report cycleReport, level monitor.CleanupLevel) bool {
+	return !d.dryRun &&
+		!report.ForcedLevel &&
+		level != monitor.LevelCritical &&
+		d.cleanupCooldown() > 0
+}
+
 func (d *daemon) updateHostFreeAfter(report *cycleReport, beforeStats *monitor.DiskStats, beforeErr error) {
 	afterStats, afterErr := d.getDiskStats(report.MonitorPath)
 	if afterErr != nil {
@@ -584,6 +660,24 @@ func targetFreeBytes(totalBytes uint64, targetUsedPercent int) (uint64, bool) {
 
 	freePercent := 100 - targetUsedPercent
 	return totalBytes * uint64(freePercent) / 100, true
+}
+
+func expandPathHome(path string) string {
+	if path == "" {
+		return ""
+	}
+	if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return path
+	}
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	return path
 }
 
 func bytesToGB(bytes uint64) string {

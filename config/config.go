@@ -20,6 +20,9 @@ type Config struct {
 	// TargetFree is the legacy config key for target maximum used percentage after cleanup.
 	TargetFree int `yaml:"target_free"`
 
+	// Policy controls daemon-level cleanup policy such as cooldown state.
+	Policy PolicyConfig `yaml:"policy"`
+
 	// LogFile path for cleanup logs
 	LogFile string `yaml:"log_file"`
 
@@ -127,6 +130,14 @@ type EnableFlags struct {
 	Bazel bool `yaml:"bazel"`
 	// APFSSnapshots for APFS snapshot thinning (Darwin)
 	APFSSnapshots bool `yaml:"apfs_snapshots"`
+}
+
+// PolicyConfig holds daemon-level cleanup policy settings.
+type PolicyConfig struct {
+	// Cooldown skips repeated non-critical daemon-triggered plugin cleanup within this duration.
+	Cooldown string `yaml:"cooldown"`
+	// StateFile stores daemon cleanup state such as per-plugin last-run timestamps.
+	StateFile string `yaml:"state_file"`
 }
 
 // DockerConfig holds Docker-specific cleanup settings.
@@ -299,6 +310,7 @@ type NotifyConfig struct {
 func DefaultConfig() *Config {
 	home, _ := os.UserHomeDir()
 	logFile := filepath.Join(home, ".local", "log", "disk-cleanup.log")
+	stateFile := filepath.Join(home, ".local", "state", "tinyland-cleanup", "state.json")
 
 	defaultScanPaths := []string{
 		filepath.Join(home, "git"),
@@ -319,7 +331,11 @@ func DefaultConfig() *Config {
 			Critical:   95,
 		},
 		TargetFree: 70,
-		LogFile:    logFile,
+		Policy: PolicyConfig{
+			Cooldown:  "30m",
+			StateFile: stateFile,
+		},
+		LogFile: logFile,
 		Enable: EnableFlags{
 			Cache:         true,
 			NixGC:         true,

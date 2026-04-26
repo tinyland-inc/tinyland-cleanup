@@ -16,6 +16,13 @@ thresholds:
 # Historical key name is target_free.
 target_free: 70
 
+# Daemon-level cleanup policy
+policy:
+  # Skip repeated non-critical daemon-triggered plugin cleanup within this window.
+  # Explicit --level runs and critical pressure bypass cooldown.
+  cooldown: 30m
+  state_file: ~/.local/state/tinyland-cleanup/state.json
+
 # Enable/disable specific cleanup plugins
 enable:
   cache: true           # pip, npm, go, cargo, maven, gradle caches
