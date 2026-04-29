@@ -85,6 +85,10 @@ podman:
   buildkit_prune_keep_storage_mb: 8192
   buildkit_prune_min_reclaim_gb: 4
 
+  # Broad system prune with volumes can remove stopped-container state and
+  # unused volumes. Keep it explicitly opt-in even under critical pressure.
+  critical_system_prune: false
+
   clean_inside_vm: true
   trim_vm_disk: true
 

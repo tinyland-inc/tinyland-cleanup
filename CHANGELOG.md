@@ -111,6 +111,9 @@ All notable changes to this project will be documented in this file.
 - Critical Darwin cache cleanup now prefers typed developer-cache targets when
   `darwin_dev_caches.enabled` is true, avoiding broad `~/Library/Caches`
   sweeps unless the typed policy is disabled.
+- Critical Podman cleanup now keeps broad `podman system prune -af --volumes`
+  behind `podman.critical_system_prune`, while targeted BuildKit cache pruning
+  remains enabled by default.
 
 ### Fixed
 
