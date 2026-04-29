@@ -512,11 +512,7 @@ func (p *PodmanPlugin) cleanBuildKitCache(ctx context.Context, cfg *config.Confi
 		"container", podmanBuildKitContainerLabel(plan),
 		"keep_duration", plan.KeepDuration,
 		"keep_storage_mb", plan.KeepStorageMB)
-	output, err := p.runPodmanCommand(ctx,
-		"exec", plan.ContainerID,
-		"buildctl", "prune",
-		"--keep-duration", plan.KeepDuration,
-		"--keep-storage", fmt.Sprintf("%dMB", plan.KeepStorageMB))
+	output, err := p.runPodmanCommand(ctx, podmanBuildKitPruneArgs(plan)...)
 	if err != nil {
 		logger.Warn("BuildKit cache prune failed", "container", podmanBuildKitContainerLabel(plan), "error", err)
 		return result, false
@@ -540,6 +536,15 @@ func (p *PodmanPlugin) cleanBuildKitCache(ctx context.Context, cfg *config.Confi
 	}
 
 	return result, trimRan
+}
+
+func podmanBuildKitPruneArgs(plan podmanBuildKitCachePlan) []string {
+	return []string{
+		"exec", plan.ContainerID,
+		"buildctl", "prune",
+		"--keep-duration", plan.KeepDuration,
+		"--keep-storage", strconv.Itoa(plan.KeepStorageMB),
+	}
 }
 
 func (p *PodmanPlugin) addTrimResult(result *CleanupResult, trim podmanVMDiskTrimResult, logger *slog.Logger) {

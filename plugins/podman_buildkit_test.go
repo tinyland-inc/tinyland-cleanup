@@ -1,6 +1,10 @@
 package plugins
 
-import "testing"
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
 
 func TestParseBuildKitDUSummary(t *testing.T) {
 	output := `
@@ -68,6 +72,30 @@ func TestBuildPodmanBuildKitCachePlanEligible(t *testing.T) {
 	}
 	if target.Reclaim != CleanupReclaimDeferred || target.HostReclaimsSpace == nil || *target.HostReclaimsSpace {
 		t.Fatalf("BuildKit target should be deferred host reclaim: %#v", target)
+	}
+}
+
+func TestPodmanBuildKitPruneArgsUseNumericKeepStorage(t *testing.T) {
+	plan := podmanBuildKitCachePlan{
+		ContainerID:   "abc123",
+		KeepDuration:  "24h",
+		KeepStorageMB: 8192,
+	}
+
+	args := podmanBuildKitPruneArgs(plan)
+	expected := []string{
+		"exec", "abc123",
+		"buildctl", "prune",
+		"--keep-duration", "24h",
+		"--keep-storage", "8192",
+	}
+	if !reflect.DeepEqual(args, expected) {
+		t.Fatalf("unexpected BuildKit prune args: %#v", args)
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "MB") {
+			t.Fatalf("buildctl keep-storage expects a numeric MB value, got arg %q in %#v", arg, args)
+		}
 	}
 }
 
