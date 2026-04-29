@@ -174,6 +174,8 @@ type PodmanConfig struct {
 	BuildKitPruneKeepStorageMB int `yaml:"buildkit_prune_keep_storage_mb"`
 	// BuildKitPruneMinReclaimGB skips BuildKit pruning below this reclaimable cache size
 	BuildKitPruneMinReclaimGB int `yaml:"buildkit_prune_min_reclaim_gb"`
+	// CriticalSystemPrune enables broad critical system prune with volumes.
+	CriticalSystemPrune bool `yaml:"critical_system_prune"`
 	// CleanInsideVM enables cleanup inside Podman machine VM (Darwin)
 	CleanInsideVM bool `yaml:"clean_inside_vm"`
 	// TrimVMDisk enables fstrim inside VM to reclaim sparse disk space (Darwin)
@@ -412,6 +414,7 @@ func DefaultConfig() *Config {
 			BuildKitPruneKeepDuration:        "24h",
 			BuildKitPruneKeepStorageMB:       8192,
 			BuildKitPruneMinReclaimGB:        4,
+			CriticalSystemPrune:              false,
 			CleanInsideVM:                    true,
 			TrimVMDisk:                       true,
 			CompactMinReclaimGB:              8,

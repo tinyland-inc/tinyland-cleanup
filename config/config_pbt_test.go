@@ -195,6 +195,9 @@ func TestPodmanConfigDefaults(t *testing.T) {
 	if cfg.Podman.BuildKitPruneMinReclaimGB < 0 {
 		t.Errorf("Podman.BuildKitPruneMinReclaimGB should be non-negative: %d", cfg.Podman.BuildKitPruneMinReclaimGB)
 	}
+	if cfg.Podman.CriticalSystemPrune {
+		t.Error("Podman.CriticalSystemPrune should default to false")
+	}
 
 	// MachineNames should have at least one entry on Darwin
 	// (but we can't check runtime.GOOS in test, so just verify it's set)

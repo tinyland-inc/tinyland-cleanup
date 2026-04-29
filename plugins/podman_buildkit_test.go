@@ -1,9 +1,14 @@
 package plugins
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/Jesssullivan/tinyland-cleanup/config"
 )
 
 func TestParseBuildKitDUSummary(t *testing.T) {
@@ -97,6 +102,64 @@ func TestPodmanBuildKitPruneArgsUseNumericKeepStorage(t *testing.T) {
 			t.Fatalf("buildctl keep-storage expects a numeric MB value, got arg %q in %#v", arg, args)
 		}
 	}
+}
+
+func TestPodmanCriticalPlanProtectsSystemPruneByDefault(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Podman.BuildKitPrune = false
+	p := &PodmanPlugin{environment: &PodmanEnvironment{Runtime: "podman"}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	plan := p.PlanCleanup(context.Background(), LevelCritical, cfg, logger)
+	if plan.Metadata["critical_system_prune_enabled"] != "false" {
+		t.Fatalf("expected critical system prune disabled metadata, got %#v", plan.Metadata)
+	}
+
+	target := findPodmanBuildKitTestTarget(t, plan.Targets, "podman_system_prune")
+	if target.Action != "protect_system_prune" || !target.Protected {
+		t.Fatalf("critical system prune should be protected by default: %#v", target)
+	}
+	if target.Reclaim != CleanupReclaimNone {
+		t.Fatalf("protected system prune should not claim reclaim: %#v", target)
+	}
+	if !strings.Contains(strings.Join(plan.Steps, "\n"), "critical_system_prune=false") {
+		t.Fatalf("plan steps should explain why broad prune is skipped: %#v", plan.Steps)
+	}
+}
+
+func TestPodmanCriticalPlanAllowsOptInSystemPrune(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Podman.BuildKitPrune = false
+	cfg.Podman.CriticalSystemPrune = true
+	p := &PodmanPlugin{environment: &PodmanEnvironment{Runtime: "podman"}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	plan := p.PlanCleanup(context.Background(), LevelCritical, cfg, logger)
+	if plan.Metadata["critical_system_prune_enabled"] != "true" {
+		t.Fatalf("expected critical system prune enabled metadata, got %#v", plan.Metadata)
+	}
+
+	target := findPodmanBuildKitTestTarget(t, plan.Targets, "podman_system_prune")
+	if target.Action != "run_system_prune" || target.Protected {
+		t.Fatalf("critical system prune should be opt-in runnable: %#v", target)
+	}
+	if target.Reclaim != CleanupReclaimDeferred {
+		t.Fatalf("system prune reclaim should stay deferred in dry-run: %#v", target)
+	}
+	if !strings.Contains(strings.Join(plan.Steps, "\n"), "Run full Podman system prune with volumes") {
+		t.Fatalf("plan steps should include broad prune when opted in: %#v", plan.Steps)
+	}
+}
+
+func findPodmanBuildKitTestTarget(t *testing.T, targets []CleanupTarget, targetType string) CleanupTarget {
+	t.Helper()
+	for _, target := range targets {
+		if target.Type == targetType {
+			return target
+		}
+	}
+	t.Fatalf("target %q not found in %#v", targetType, targets)
+	return CleanupTarget{}
 }
 
 func TestBuildPodmanBuildKitCachePlanBelowMinimum(t *testing.T) {

@@ -220,10 +220,17 @@ func (p *PodmanPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg 
 			plan.Warnings = append(plan.Warnings, "guest fstrim output is not counted as host bytes for this provider; measured host free-space delta remains authoritative")
 		}
 	case LevelCritical:
-		plan.Steps = append(plan.Steps,
-			"Run full Podman system prune with volumes",
-			"Prune external Podman storage when supported",
-		)
+		plan.Metadata["critical_system_prune_enabled"] = strconv.FormatBool(cfg.Podman.CriticalSystemPrune)
+		plan.Targets = append(plan.Targets, podmanCriticalSystemPruneTarget(cfg.Podman.CriticalSystemPrune))
+		if cfg.Podman.CriticalSystemPrune {
+			plan.Steps = append(plan.Steps,
+				"Run full Podman system prune with volumes",
+				"Prune external Podman storage when supported",
+			)
+		} else {
+			plan.Steps = append(plan.Steps, "Skip broad Podman system prune because podman.critical_system_prune=false")
+			plan.Warnings = append(plan.Warnings, "broad Podman system prune with volumes is disabled; enable podman.critical_system_prune only after reviewing stopped containers and unused volumes")
+		}
 		buildKit := p.planBuildKitCache(ctx, cfg, logger)
 		plan.Warnings = append(plan.Warnings, buildKit.Warnings...)
 		plan.Steps = append(plan.Steps, buildKit.Steps...)
@@ -239,8 +246,10 @@ func (p *PodmanPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg 
 		plan.Metadata["buildkit_cache_reclaimable_bytes"] = strconv.FormatInt(buildKit.ReclaimableBytes, 10)
 		plan.Metadata["buildkit_cache_total_bytes"] = strconv.FormatInt(buildKit.TotalBytes, 10)
 		if runtime.GOOS == "darwin" && p.environment.VMRunning {
-			if cfg.Podman.CleanInsideVM {
+			if cfg.Podman.CleanInsideVM && cfg.Podman.CriticalSystemPrune {
 				plan.Steps = append(plan.Steps, "Run critical cleanup inside the Podman VM")
+			} else if cfg.Podman.CleanInsideVM {
+				plan.Steps = append(plan.Steps, "Skip critical Podman VM system prune because podman.critical_system_prune=false")
 			}
 			if cfg.Podman.TrimVMDisk && !p.fstrimReclaimsHostSpace() {
 				plan.Warnings = append(plan.Warnings, "guest fstrim output is not counted as host bytes for this provider; measured host free-space delta remains authoritative")
@@ -438,35 +447,41 @@ func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, lo
 		result.ItemsCleaned += buildKitResult.ItemsCleaned
 	}
 
-	// Full system prune with volumes
-	logger.Warn("CRITICAL: running full Podman system prune with volumes")
-	output, err := p.runPodmanCommand(ctx, "system", "prune", "-af", "--volumes")
-	if err != nil {
-		logger.Error("full system prune failed", "error", err)
-		result.Error = err
-		return result
-	}
-	result.BytesFreed += p.parseReclaimedSpace(output)
-	result.ItemsCleaned++
-
-	// Clean external/orphaned storage (transient mode)
-	logger.Warn("CRITICAL: cleaning external podman storage")
-	if output, err := p.runPodmanCommand(ctx, "system", "prune", "--external", "-f"); err == nil {
+	if cfg.Podman.CriticalSystemPrune {
+		// Full system prune with volumes.
+		logger.Warn("CRITICAL: running full Podman system prune with volumes")
+		output, err := p.runPodmanCommand(ctx, "system", "prune", "-af", "--volumes")
+		if err != nil {
+			logger.Error("full system prune failed", "error", err)
+			result.Error = err
+			return result
+		}
 		result.BytesFreed += p.parseReclaimedSpace(output)
 		result.ItemsCleaned++
+
+		// Clean external/orphaned storage (transient mode).
+		logger.Warn("CRITICAL: cleaning external podman storage")
+		if output, err := p.runPodmanCommand(ctx, "system", "prune", "--external", "-f"); err == nil {
+			result.BytesFreed += p.parseReclaimedSpace(output)
+			result.ItemsCleaned++
+		} else {
+			// --external might not be supported on older versions
+			logger.Debug("external storage cleanup not available", "error", err)
+		}
 	} else {
-		// --external might not be supported on older versions
-		logger.Debug("external storage cleanup not available", "error", err)
+		logger.Warn("skipping broad Podman system prune with volumes", "reason", "critical_system_prune_disabled")
 	}
 
 	// On Darwin, aggressive VM cleanup
 	if runtime.GOOS == "darwin" && p.environment.VMRunning {
 		// First, clean inside the VM
-		if cfg.Podman.CleanInsideVM {
+		if cfg.Podman.CleanInsideVM && cfg.Podman.CriticalSystemPrune {
 			logger.Warn("CRITICAL: cleaning inside Podman VM")
 			vmResult := p.cleanInsideVM(ctx, LevelCritical, logger)
 			result.BytesFreed += vmResult.BytesFreed
 			result.ItemsCleaned += vmResult.ItemsCleaned
+		} else if cfg.Podman.CleanInsideVM {
+			logger.Warn("skipping critical Podman VM system prune", "reason", "critical_system_prune_disabled")
 		}
 
 		// Then fstrim to reclaim space when the provider reports that discard
@@ -545,6 +560,26 @@ func podmanBuildKitPruneArgs(plan podmanBuildKitCachePlan) []string {
 		"--keep-duration", plan.KeepDuration,
 		"--keep-storage", strconv.Itoa(plan.KeepStorageMB),
 	}
+}
+
+func podmanCriticalSystemPruneTarget(enabled bool) CleanupTarget {
+	target := CleanupTarget{
+		Type:   "podman_system_prune",
+		Name:   "critical Podman system prune",
+		Tier:   CleanupTierDisruptive,
+		Action: "run_system_prune",
+		Reason: "critical level may prune stopped containers, unused images, unused volumes, and external storage",
+	}
+	if enabled {
+		annotateCleanupTargetPolicy(&target, CleanupTierDisruptive, CleanupReclaimDeferred)
+		return target
+	}
+
+	target.Action = "protect_system_prune"
+	target.Protected = true
+	target.Reason = "broad Podman system prune with volumes is disabled by podman.critical_system_prune=false"
+	annotateCleanupTargetPolicy(&target, CleanupTierDisruptive, CleanupReclaimNone)
+	return target
 }
 
 func (p *PodmanPlugin) addTrimResult(result *CleanupResult, trim podmanVMDiskTrimResult, logger *slog.Logger) {

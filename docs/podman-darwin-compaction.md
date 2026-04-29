@@ -13,6 +13,11 @@ a storage floor, then runs advisory `fstrim`. The BuildKit command total is
 reported as `command_bytes_freed`; host reclaim is reported only from the
 measured host free-space delta after the trim.
 
+Broad `podman system prune -af --volumes` is not part of the default critical
+path. It can remove stopped-container state and unused volumes, so it is
+reported as a protected disruptive target unless `podman.critical_system_prune`
+is explicitly enabled.
+
 ## Review
 
 Use dry-run JSON before enabling offline compaction:
@@ -53,11 +58,17 @@ podman:
   buildkit_prune_keep_duration: 24h
   buildkit_prune_keep_storage_mb: 8192
   buildkit_prune_min_reclaim_gb: 4
+  critical_system_prune: false
 ```
 
 This does not stop the Podman VM or delete the builder volume wholesale. It is
 still warm-cache cleanup: active builds may lose reusable cache, so the daemon
 keeps the newest records and a configured storage floor.
+
+Set `critical_system_prune: true` only for an attended emergency pass after
+reviewing stopped containers and unused volumes. This enables broad
+`podman system prune -af --volumes`, external storage pruning when supported,
+and the matching critical VM system-prune path.
 
 Offline compaction is opt-in because it stops the Podman machine:
 
