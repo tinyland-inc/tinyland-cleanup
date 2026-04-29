@@ -14,6 +14,9 @@ All notable changes to this project will be documented in this file.
   accounting.
 - Podman offline compaction preflight for Darwin VM disks, including physical
   allocation accounting and active-container safety gates.
+- Podman BuildKit cache planning and critical cleanup with retention guards,
+  command-byte reporting, and Darwin host free-space delta accounting after
+  advisory VM trim.
 - Structured dry-run targets for Darwin developer caches such as JetBrains,
   Playwright, Bazelisk, and pip.
 - Nix cleanup preflight plans with dry-run reclaim estimates, generation

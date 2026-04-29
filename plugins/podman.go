@@ -42,6 +42,45 @@ type PodmanEnvironment struct {
 
 const podmanCompactionGiB = int64(1024 * 1024 * 1024)
 
+type podmanBuildKitCachePlan struct {
+	Enabled          bool
+	ContainerID      string
+	ContainerName    string
+	KeepDuration     string
+	KeepStorageMB    int
+	MinReclaimBytes  int64
+	ReclaimableBytes int64
+	TotalBytes       int64
+	CanPrune         bool
+	SkipReason       string
+	InspectionError  string
+	Warnings         []string
+	Steps            []string
+}
+
+type podmanBuildKitCachePlanInput struct {
+	Enabled          bool
+	ContainerID      string
+	ContainerName    string
+	KeepDuration     string
+	KeepStorageMB    int
+	MinReclaimBytes  int64
+	ReclaimableBytes int64
+	TotalBytes       int64
+	InspectionError  string
+}
+
+type podmanBuildKitContainer struct {
+	ID   string
+	Name string
+}
+
+type podmanVMDiskTrimResult struct {
+	TrimmedBytes   int64
+	HostBytesFreed int64
+	MeasurePath    string
+}
+
 type podmanCompactionPlan struct {
 	MachineName               string
 	Provider                  string
@@ -178,19 +217,33 @@ func (p *PodmanPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg 
 			"Prune Podman build containers",
 		)
 		if runtime.GOOS == "darwin" && p.environment.VMRunning && cfg.Podman.TrimVMDisk && !p.fstrimReclaimsHostSpace() {
-			plan.Warnings = append(plan.Warnings, "guest fstrim is not counted as host reclaim for this provider")
+			plan.Warnings = append(plan.Warnings, "guest fstrim output is not counted as host bytes for this provider; measured host free-space delta remains authoritative")
 		}
 	case LevelCritical:
 		plan.Steps = append(plan.Steps,
 			"Run full Podman system prune with volumes",
 			"Prune external Podman storage when supported",
 		)
+		buildKit := p.planBuildKitCache(ctx, cfg, logger)
+		plan.Warnings = append(plan.Warnings, buildKit.Warnings...)
+		plan.Steps = append(plan.Steps, buildKit.Steps...)
+		plan.Targets = append(plan.Targets, podmanBuildKitCacheTargets(buildKit)...)
+		plan.Metadata["buildkit_cache_enabled"] = strconv.FormatBool(buildKit.Enabled)
+		plan.Metadata["buildkit_cache_can_prune"] = strconv.FormatBool(buildKit.CanPrune)
+		plan.Metadata["buildkit_cache_skip_reason"] = buildKit.SkipReason
+		plan.Metadata["buildkit_cache_container"] = buildKit.ContainerName
+		plan.Metadata["buildkit_cache_container_id"] = buildKit.ContainerID
+		plan.Metadata["buildkit_cache_keep_duration"] = buildKit.KeepDuration
+		plan.Metadata["buildkit_cache_keep_storage_mb"] = strconv.Itoa(buildKit.KeepStorageMB)
+		plan.Metadata["buildkit_cache_min_reclaim_bytes"] = strconv.FormatInt(buildKit.MinReclaimBytes, 10)
+		plan.Metadata["buildkit_cache_reclaimable_bytes"] = strconv.FormatInt(buildKit.ReclaimableBytes, 10)
+		plan.Metadata["buildkit_cache_total_bytes"] = strconv.FormatInt(buildKit.TotalBytes, 10)
 		if runtime.GOOS == "darwin" && p.environment.VMRunning {
 			if cfg.Podman.CleanInsideVM {
 				plan.Steps = append(plan.Steps, "Run critical cleanup inside the Podman VM")
 			}
 			if cfg.Podman.TrimVMDisk && !p.fstrimReclaimsHostSpace() {
-				plan.Warnings = append(plan.Warnings, "guest fstrim is not counted as host reclaim for this provider")
+				plan.Warnings = append(plan.Warnings, "guest fstrim output is not counted as host bytes for this provider; measured host free-space delta remains authoritative")
 			}
 
 			compaction := p.planOfflineCompaction(ctx, cfg, logger)
@@ -221,8 +274,8 @@ func (p *PodmanPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg 
 			plan.Metadata["offline_compaction_scratch_dir_available"] = strconv.FormatBool(compaction.ScratchDirAvailable)
 			plan.Metadata["offline_compaction_scratch_dir_cross_device"] = strconv.FormatBool(compaction.ScratchDirCrossDevice)
 			plan.Metadata["offline_compaction_cross_device_replacement"] = strconv.FormatBool(compaction.CrossDeviceReplacement)
-			plan.Metadata["target_count"] = strconv.Itoa(len(plan.Targets))
 		}
+		plan.Metadata["target_count"] = strconv.Itoa(len(plan.Targets))
 	}
 
 	return plan
@@ -356,20 +409,12 @@ func (p *PodmanPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 
 	// On Darwin, run fstrim inside VM to reclaim sparse disk space when the
 	// provider reflects guest discard operations back to the host disk image.
+	// Providers such as applehv still benefit from fstrim after guest cleanup,
+	// but only the measured host free-space delta is counted.
 	if runtime.GOOS == "darwin" && p.environment.VMRunning && cfg.Podman.TrimVMDisk {
-		if !p.fstrimReclaimsHostSpace() {
-			logger.Warn("skipping Podman VM fstrim accounting; provider does not shrink host disk images from guest fstrim",
-				"machine", p.environment.MachineName,
-				"provider", p.environment.VMProvider,
-				"suggestion", "use offline compaction for actual host-side reclamation")
-			return result
-		}
-
 		logger.Debug("running fstrim in Podman VM", "machine", p.environment.MachineName)
-		if trimmed, err := p.trimVMDisk(ctx, logger); err == nil && trimmed > 0 {
-			result.BytesFreed += trimmed
-			result.ItemsCleaned++
-			logger.Info("reclaimed sparse disk space from Podman VM", "freed_mb", trimmed/(1024*1024))
+		if trim, err := p.trimVMDiskWithHostDelta(ctx, logger); err == nil {
+			p.addTrimResult(&result, trim, logger)
 		} else if err != nil {
 			logger.Warn("fstrim in Podman VM failed", "error", err)
 		}
@@ -382,6 +427,17 @@ func (p *PodmanPlugin) cleanAggressive(ctx context.Context, cfg *config.Config, 
 func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, logger *slog.Logger) CleanupResult {
 	result := CleanupResult{Plugin: p.Name(), Level: LevelCritical}
 
+	buildKitTrimRan := false
+	if cfg.Podman.BuildKitPrune {
+		buildKitResult, trimRan := p.cleanBuildKitCache(ctx, cfg, logger)
+		buildKitTrimRan = trimRan
+		result.BytesFreed += buildKitResult.BytesFreed
+		result.EstimatedBytesFreed += buildKitResult.EstimatedBytesFreed
+		result.CommandBytesFreed += buildKitResult.CommandBytesFreed
+		result.HostBytesFreed += buildKitResult.HostBytesFreed
+		result.ItemsCleaned += buildKitResult.ItemsCleaned
+	}
+
 	// Full system prune with volumes
 	logger.Warn("CRITICAL: running full Podman system prune with volumes")
 	output, err := p.runPodmanCommand(ctx, "system", "prune", "-af", "--volumes")
@@ -390,7 +446,7 @@ func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, lo
 		result.Error = err
 		return result
 	}
-	result.BytesFreed = p.parseReclaimedSpace(output)
+	result.BytesFreed += p.parseReclaimedSpace(output)
 	result.ItemsCleaned++
 
 	// Clean external/orphaned storage (transient mode)
@@ -414,16 +470,11 @@ func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, lo
 		}
 
 		// Then fstrim to reclaim space when the provider reports that discard
-		// as host-side sparse image reclamation.
-		if cfg.Podman.TrimVMDisk {
-			if !p.fstrimReclaimsHostSpace() {
-				logger.Warn("skipping Podman VM fstrim accounting; provider does not shrink host disk images from guest fstrim",
-					"machine", p.environment.MachineName,
-					"provider", p.environment.VMProvider,
-					"suggestion", "use offline compaction for actual host-side reclamation")
-			} else if trimmed, err := p.trimVMDisk(ctx, logger); err == nil && trimmed > 0 {
-				result.BytesFreed += trimmed
-				result.ItemsCleaned++
+		// as host-side sparse image reclamation. If BuildKit cleanup already
+		// trimmed the VM, do not trim a second time in the same cycle.
+		if cfg.Podman.TrimVMDisk && !buildKitTrimRan {
+			if trim, err := p.trimVMDiskWithHostDelta(ctx, logger); err == nil {
+				p.addTrimResult(&result, trim, logger)
 			} else if err != nil {
 				logger.Warn("fstrim in Podman VM failed", "error", err)
 			}
@@ -446,6 +497,74 @@ func (p *PodmanPlugin) cleanCritical(ctx context.Context, cfg *config.Config, lo
 	}
 
 	return result
+}
+
+func (p *PodmanPlugin) cleanBuildKitCache(ctx context.Context, cfg *config.Config, logger *slog.Logger) (CleanupResult, bool) {
+	result := CleanupResult{Plugin: p.Name(), Level: LevelCritical}
+
+	plan := p.planBuildKitCache(ctx, cfg, logger)
+	if !plan.CanPrune {
+		logger.Debug("skipping BuildKit cache prune", "reason", plan.SkipReason)
+		return result, false
+	}
+
+	logger.Warn("CRITICAL: pruning BuildKit cache",
+		"container", podmanBuildKitContainerLabel(plan),
+		"keep_duration", plan.KeepDuration,
+		"keep_storage_mb", plan.KeepStorageMB)
+	output, err := p.runPodmanCommand(ctx,
+		"exec", plan.ContainerID,
+		"buildctl", "prune",
+		"--keep-duration", plan.KeepDuration,
+		"--keep-storage", fmt.Sprintf("%dMB", plan.KeepStorageMB))
+	if err != nil {
+		logger.Warn("BuildKit cache prune failed", "container", podmanBuildKitContainerLabel(plan), "error", err)
+		return result, false
+	}
+
+	if commandFreed := parseBuildKitPruneSummary(output); commandFreed > 0 {
+		result.CommandBytesFreed += commandFreed
+		result.ItemsCleaned++
+		logger.Info("BuildKit cache prune completed", "command_freed_mb", commandFreed/(1024*1024))
+	}
+
+	trimRan := false
+	if runtime.GOOS == "darwin" && p.environment.VMRunning && cfg.Podman.TrimVMDisk {
+		logger.Debug("running fstrim after BuildKit cache prune", "machine", p.environment.MachineName)
+		trimRan = true
+		if trim, err := p.trimVMDiskWithHostDelta(ctx, logger); err == nil {
+			p.addTrimResult(&result, trim, logger)
+		} else {
+			logger.Warn("fstrim after BuildKit cache prune failed", "error", err)
+		}
+	}
+
+	return result, trimRan
+}
+
+func (p *PodmanPlugin) addTrimResult(result *CleanupResult, trim podmanVMDiskTrimResult, logger *slog.Logger) {
+	if trim.HostBytesFreed > 0 {
+		result.BytesFreed += trim.HostBytesFreed
+		result.HostBytesFreed += trim.HostBytesFreed
+		result.ItemsCleaned++
+		logger.Info("measured Podman VM host free-space reclaim",
+			"freed_mb", trim.HostBytesFreed/(1024*1024),
+			"measure_path", trim.MeasurePath)
+		return
+	}
+	if p.fstrimReclaimsHostSpace() && trim.TrimmedBytes > 0 {
+		result.BytesFreed += trim.TrimmedBytes
+		result.ItemsCleaned++
+		logger.Info("reclaimed sparse disk space from Podman VM", "freed_mb", trim.TrimmedBytes/(1024*1024))
+		return
+	}
+	if trim.TrimmedBytes > 0 {
+		logger.Warn("Podman VM fstrim reported guest trim bytes without measured host reclaim",
+			"trimmed_mb", trim.TrimmedBytes/(1024*1024),
+			"machine", p.environment.MachineName,
+			"provider", p.environment.VMProvider,
+			"measure_path", trim.MeasurePath)
+	}
 }
 
 // runPodmanCommand executes a podman command with timeout.
@@ -508,6 +627,233 @@ func (p *PodmanPlugin) parseReclaimedSpace(output string) int64 {
 	}
 
 	return 0
+}
+
+func (p *PodmanPlugin) planBuildKitCache(ctx context.Context, cfg *config.Config, logger *slog.Logger) podmanBuildKitCachePlan {
+	input := podmanBuildKitCachePlanInput{
+		Enabled:         cfg.Podman.BuildKitPrune,
+		KeepDuration:    cfg.Podman.BuildKitPruneKeepDuration,
+		KeepStorageMB:   cfg.Podman.BuildKitPruneKeepStorageMB,
+		MinReclaimBytes: int64(cfg.Podman.BuildKitPruneMinReclaimGB) * podmanCompactionGiB,
+	}
+	if !cfg.Podman.BuildKitPrune {
+		return buildPodmanBuildKitCachePlan(input)
+	}
+
+	containers, err := p.listBuildKitContainers(ctx)
+	if err != nil {
+		input.InspectionError = err.Error()
+		return buildPodmanBuildKitCachePlan(input)
+	}
+	if len(containers) == 0 {
+		return buildPodmanBuildKitCachePlan(input)
+	}
+
+	input.ContainerID = containers[0].ID
+	input.ContainerName = containers[0].Name
+	output, err := p.runPodmanCommand(ctx, "exec", input.ContainerID, "buildctl", "du")
+	if err != nil {
+		logger.Debug("BuildKit cache inspection failed", "container", input.ContainerName, "error", err)
+		input.InspectionError = err.Error()
+		return buildPodmanBuildKitCachePlan(input)
+	}
+	input.ReclaimableBytes, input.TotalBytes = parseBuildKitDUSummary(output)
+	return buildPodmanBuildKitCachePlan(input)
+}
+
+func buildPodmanBuildKitCachePlan(input podmanBuildKitCachePlanInput) podmanBuildKitCachePlan {
+	keepDuration := strings.TrimSpace(input.KeepDuration)
+	if keepDuration == "" {
+		keepDuration = "24h"
+	}
+	keepStorageMB := input.KeepStorageMB
+	if keepStorageMB <= 0 {
+		keepStorageMB = 8192
+	}
+
+	plan := podmanBuildKitCachePlan{
+		Enabled:          input.Enabled,
+		ContainerID:      input.ContainerID,
+		ContainerName:    input.ContainerName,
+		KeepDuration:     keepDuration,
+		KeepStorageMB:    keepStorageMB,
+		MinReclaimBytes:  input.MinReclaimBytes,
+		ReclaimableBytes: input.ReclaimableBytes,
+		TotalBytes:       input.TotalBytes,
+		InspectionError:  input.InspectionError,
+	}
+
+	switch {
+	case !input.Enabled:
+		plan.SkipReason = "buildkit_prune_disabled"
+	case input.InspectionError != "":
+		plan.SkipReason = "buildkit_cache_inspection_failed"
+	case input.ContainerID == "":
+		plan.SkipReason = "buildkit_container_not_running"
+	case input.ReclaimableBytes <= 0:
+		plan.SkipReason = "buildkit_cache_reclaimable_unknown"
+	case input.MinReclaimBytes > 0 && input.ReclaimableBytes < input.MinReclaimBytes:
+		plan.SkipReason = "below_minimum_buildkit_reclaim"
+	default:
+		plan.CanPrune = true
+	}
+
+	if input.ContainerID != "" {
+		plan.Steps = append(plan.Steps,
+			fmt.Sprintf("Inspect BuildKit cache in Podman container %q", podmanBuildKitContainerLabel(plan)),
+			fmt.Sprintf("Run buildctl prune with keep-duration %s and keep-storage %dMB", plan.KeepDuration, plan.KeepStorageMB),
+		)
+		if runtime.GOOS == "darwin" {
+			plan.Steps = append(plan.Steps, "Run advisory Podman VM fstrim and measure host free-space delta")
+			plan.Warnings = append(plan.Warnings, "BuildKit cache prune is guest-side reclaim; host bytes are counted only from measured host free-space delta")
+		}
+	}
+	if input.InspectionError != "" {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf("BuildKit cache inspection failed: %s", input.InspectionError))
+	}
+
+	return plan
+}
+
+func podmanBuildKitCacheTargets(plan podmanBuildKitCachePlan) []CleanupTarget {
+	if plan.ContainerID == "" && plan.InspectionError == "" {
+		return nil
+	}
+
+	action := "prune_buildkit_cache"
+	reclaim := CleanupReclaimDeferred
+	reason := fmt.Sprintf("BuildKit reports reclaimable cache; prune keeps records newer than %s and at least %dMB", plan.KeepDuration, plan.KeepStorageMB)
+	protected := false
+	if !plan.CanPrune {
+		action = "protect_buildkit_cache"
+		reclaim = CleanupReclaimNone
+		reason = podmanBuildKitSkipReason(plan.SkipReason)
+		protected = true
+	}
+	if plan.SkipReason == "buildkit_cache_inspection_failed" {
+		action = "protect_buildkit_inspection"
+	}
+
+	target := CleanupTarget{
+		Type:      "podman_buildkit_cache",
+		Tier:      CleanupTierWarm,
+		Name:      podmanBuildKitContainerLabel(plan),
+		Bytes:     plan.ReclaimableBytes,
+		Protected: protected,
+		Action:    action,
+		Reason:    reason,
+	}
+	annotateCleanupTargetPolicy(&target, target.Tier, reclaim)
+	return []CleanupTarget{target}
+}
+
+func podmanBuildKitSkipReason(reason string) string {
+	switch reason {
+	case "":
+		return "BuildKit cache prune is not eligible"
+	case "buildkit_prune_disabled":
+		return "BuildKit cache pruning is disabled by config"
+	case "buildkit_container_not_running":
+		return "no running buildx BuildKit container was detected"
+	case "buildkit_cache_reclaimable_unknown":
+		return "BuildKit did not report reclaimable cache"
+	case "below_minimum_buildkit_reclaim":
+		return "BuildKit reclaimable cache is below the configured prune threshold"
+	case "buildkit_cache_inspection_failed":
+		return "BuildKit cache could not be inspected"
+	default:
+		return "BuildKit cache preflight blocked pruning: " + reason
+	}
+}
+
+func podmanBuildKitContainerLabel(plan podmanBuildKitCachePlan) string {
+	if plan.ContainerName != "" {
+		return plan.ContainerName
+	}
+	if plan.ContainerID != "" {
+		return plan.ContainerID
+	}
+	return "buildkit"
+}
+
+func (p *PodmanPlugin) listBuildKitContainers(ctx context.Context) ([]podmanBuildKitContainer, error) {
+	output, err := p.runPodmanCommand(ctx, "ps", "--filter", "name=buildx_buildkit", "--format", "{{.ID}}\t{{.Names}}")
+	if err != nil {
+		return nil, err
+	}
+
+	var containers []podmanBuildKitContainer
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		container := podmanBuildKitContainer{ID: strings.TrimSpace(parts[0])}
+		if len(parts) > 1 {
+			container.Name = strings.TrimSpace(parts[1])
+		}
+		if container.ID == "" {
+			continue
+		}
+		if container.Name == "" {
+			container.Name = container.ID
+		}
+		containers = append(containers, container)
+	}
+	return containers, nil
+}
+
+func parseBuildKitDUSummary(output string) (int64, int64) {
+	var reclaimable int64
+	var total int64
+	re := regexp.MustCompile(`(?im)^\s*(Reclaimable|Total):\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B|[KMGT]?B|B)\s*$`)
+	for _, match := range re.FindAllStringSubmatch(output, -1) {
+		if len(match) < 4 {
+			continue
+		}
+		value, err := strconv.ParseFloat(match[2], 64)
+		if err != nil {
+			continue
+		}
+		bytes := parsePodmanByteQuantity(value, match[3])
+		switch strings.ToLower(match[1]) {
+		case "reclaimable":
+			reclaimable = bytes
+		case "total":
+			total = bytes
+		}
+	}
+	return reclaimable, total
+}
+
+func parseBuildKitPruneSummary(output string) int64 {
+	re := regexp.MustCompile(`(?im)^\s*Total:\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B|[KMGT]?B|B)\s*$`)
+	match := re.FindStringSubmatch(output)
+	if len(match) < 3 {
+		return 0
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0
+	}
+	return parsePodmanByteQuantity(value, match[2])
+}
+
+func parsePodmanByteQuantity(value float64, unit string) int64 {
+	unit = strings.ToUpper(strings.TrimSpace(unit))
+	switch {
+	case strings.HasPrefix(unit, "K"):
+		return int64(value * 1024)
+	case strings.HasPrefix(unit, "M"):
+		return int64(value * 1024 * 1024)
+	case strings.HasPrefix(unit, "G"):
+		return int64(value * 1024 * 1024 * 1024)
+	case strings.HasPrefix(unit, "T"):
+		return int64(value * 1024 * 1024 * 1024 * 1024)
+	default:
+		return int64(value)
+	}
 }
 
 // detectPodmanEnvironment detects the Podman runtime environment.
@@ -633,6 +979,58 @@ func (p *PodmanPlugin) trimVMDisk(ctx context.Context, logger *slog.Logger) (int
 	}
 
 	return parseFstrimOutput(string(output)), nil
+}
+
+func (p *PodmanPlugin) trimVMDiskWithHostDelta(ctx context.Context, logger *slog.Logger) (podmanVMDiskTrimResult, error) {
+	result := podmanVMDiskTrimResult{
+		MeasurePath: p.podmanHostMeasurePath(ctx, logger),
+	}
+
+	var before int64
+	var beforeOK bool
+	if result.MeasurePath != "" {
+		if free, err := getFreeDiskSpace(result.MeasurePath); err == nil {
+			before = int64FromUint64(free)
+			beforeOK = true
+		} else {
+			logger.Debug("Podman host free-space preflight failed", "path", result.MeasurePath, "error", err)
+		}
+	}
+
+	trimmed, err := p.trimVMDisk(ctx, logger)
+	result.TrimmedBytes = trimmed
+	if err != nil {
+		return result, err
+	}
+
+	if beforeOK {
+		if free, err := getFreeDiskSpace(result.MeasurePath); err == nil {
+			after := int64FromUint64(free)
+			if after > before {
+				result.HostBytesFreed = after - before
+			}
+		} else {
+			logger.Debug("Podman host free-space post-trim check failed", "path", result.MeasurePath, "error", err)
+		}
+	}
+
+	return result, nil
+}
+
+func (p *PodmanPlugin) podmanHostMeasurePath(ctx context.Context, logger *slog.Logger) string {
+	if runtime.GOOS == "darwin" {
+		if diskPath, err := p.getMachineDiskPath(ctx); err == nil && diskPath != "" {
+			return filepath.Dir(diskPath)
+		} else if err != nil {
+			logger.Debug("Podman disk path unavailable for host free-space measurement", "error", err)
+		}
+	}
+
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		return home
+	}
+	return "."
 }
 
 // parseFstrimOutput extracts bytes trimmed from fstrim output.

@@ -76,6 +76,15 @@ podman:
   protect_running_containers: true
   machine_names:
     - podman-machine-default
+
+  # Critical-level BuildKit cache pruning targets the buildx builder cache
+  # inside a running Podman VM. Guest-reported reclaim is recorded separately;
+  # Darwin host reclaim is counted only from measured host free-space deltas.
+  buildkit_prune: true
+  buildkit_prune_keep_duration: 24h
+  buildkit_prune_keep_storage_mb: 8192
+  buildkit_prune_min_reclaim_gb: 4
+
   clean_inside_vm: true
   trim_vm_disk: true
 
@@ -148,11 +157,14 @@ dev_artifacts:
     - ~/git
     - ~/src
     - ~/projects
+  scan_max_duration: 30s
+  scan_max_entries: 250000
   # Review-only: surface large top-level temp proof/output trees without
   # deleting them automatically. Darwin compiled defaults use /private/tmp.
   temp_artifacts: true
   temp_scan_paths:
     - /private/tmp
+  temp_scan_max_roots: 128
   temp_artifact_min_mb: 256
   temp_artifact_stale_after: 6h
   node_modules: true

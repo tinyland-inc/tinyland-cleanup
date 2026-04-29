@@ -166,6 +166,14 @@ type PodmanConfig struct {
 	ProtectRunningContainers bool `yaml:"protect_running_containers"`
 	// MachineNames to check for cleanup (Darwin)
 	MachineNames []string `yaml:"machine_names"`
+	// BuildKitPrune enables targeted BuildKit cache pruning at critical level
+	BuildKitPrune bool `yaml:"buildkit_prune"`
+	// BuildKitPruneKeepDuration preserves BuildKit records newer than this duration
+	BuildKitPruneKeepDuration string `yaml:"buildkit_prune_keep_duration"`
+	// BuildKitPruneKeepStorageMB preserves this much BuildKit cache after pruning
+	BuildKitPruneKeepStorageMB int `yaml:"buildkit_prune_keep_storage_mb"`
+	// BuildKitPruneMinReclaimGB skips BuildKit pruning below this reclaimable cache size
+	BuildKitPruneMinReclaimGB int `yaml:"buildkit_prune_min_reclaim_gb"`
 	// CleanInsideVM enables cleanup inside Podman machine VM (Darwin)
 	CleanInsideVM bool `yaml:"clean_inside_vm"`
 	// TrimVMDisk enables fstrim inside VM to reclaim sparse disk space (Darwin)
@@ -398,6 +406,10 @@ func DefaultConfig() *Config {
 			PruneImagesAge:                   "24h",
 			ProtectRunningContainers:         true,
 			MachineNames:                     []string{"podman-machine-default"},
+			BuildKitPrune:                    true,
+			BuildKitPruneKeepDuration:        "24h",
+			BuildKitPruneKeepStorageMB:       8192,
+			BuildKitPruneMinReclaimGB:        4,
 			CleanInsideVM:                    true,
 			TrimVMDisk:                       true,
 			CompactMinReclaimGB:              8,
