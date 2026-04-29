@@ -112,6 +112,11 @@ All notable changes to this project will be documented in this file.
   `darwin_dev_caches.enabled` is true, avoiding broad `~/Library/Caches`
   sweeps unless the typed policy is disabled.
 
+### Fixed
+
+- Pass BuildKit `--keep-storage` as the numeric MB value expected by `buildctl`
+  during targeted Podman cache pruning.
+
 ## [0.2.0]
 
 ### Added
