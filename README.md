@@ -106,7 +106,9 @@ See [docs/operator-workflow.md](docs/operator-workflow.md) for the current
 dry-run, candidate policy tier, and host free-space accounting workflow.
 
 Podman on macOS needs extra care because `applehv` raw sparse images do not
-shrink from guest `fstrim` alone. See
+prove host reclaim from guest `fstrim` output alone. Critical cleanup can prune
+BuildKit cache inside a running buildx builder and then count only the measured
+host free-space delta after advisory trim. See
 [docs/podman-darwin-compaction.md](docs/podman-darwin-compaction.md) before
 enabling offline compaction.
 

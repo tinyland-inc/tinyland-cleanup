@@ -243,6 +243,18 @@ func TestLimaCompactDefaults(t *testing.T) {
 
 func TestPodmanCompactDefaults(t *testing.T) {
 	cfg := DefaultConfig()
+	if !cfg.Podman.BuildKitPrune {
+		t.Error("Podman.BuildKitPrune should default to true")
+	}
+	if cfg.Podman.BuildKitPruneKeepDuration != "24h" {
+		t.Errorf("Podman.BuildKitPruneKeepDuration should default to 24h, got %q", cfg.Podman.BuildKitPruneKeepDuration)
+	}
+	if cfg.Podman.BuildKitPruneKeepStorageMB != 8192 {
+		t.Errorf("Podman.BuildKitPruneKeepStorageMB should default to 8192, got %d", cfg.Podman.BuildKitPruneKeepStorageMB)
+	}
+	if cfg.Podman.BuildKitPruneMinReclaimGB != 4 {
+		t.Errorf("Podman.BuildKitPruneMinReclaimGB should default to 4, got %d", cfg.Podman.BuildKitPruneMinReclaimGB)
+	}
 	if cfg.Podman.CompactDiskOffline {
 		t.Error("Podman.CompactDiskOffline should be false by default (opt-in)")
 	}
@@ -438,6 +450,10 @@ apfs:
 lima:
   compact_offline: true
 podman:
+  buildkit_prune: false
+  buildkit_prune_keep_duration: 48h
+  buildkit_prune_keep_storage_mb: 4096
+  buildkit_prune_min_reclaim_gb: 12
   compact_disk_offline: true
   compact_min_reclaim_gb: 12
   compact_require_no_active_containers: false
@@ -564,6 +580,18 @@ darwin_dev_caches:
 	}
 	if !cfg.Podman.CompactDiskOffline {
 		t.Error("Podman.CompactDiskOffline should be true per config")
+	}
+	if cfg.Podman.BuildKitPrune {
+		t.Error("Podman.BuildKitPrune should be false per config")
+	}
+	if cfg.Podman.BuildKitPruneKeepDuration != "48h" {
+		t.Errorf("Podman.BuildKitPruneKeepDuration should be 48h per config, got %q", cfg.Podman.BuildKitPruneKeepDuration)
+	}
+	if cfg.Podman.BuildKitPruneKeepStorageMB != 4096 {
+		t.Errorf("Podman.BuildKitPruneKeepStorageMB should be 4096 per config, got %d", cfg.Podman.BuildKitPruneKeepStorageMB)
+	}
+	if cfg.Podman.BuildKitPruneMinReclaimGB != 12 {
+		t.Errorf("Podman.BuildKitPruneMinReclaimGB should be 12 per config, got %d", cfg.Podman.BuildKitPruneMinReclaimGB)
 	}
 	if cfg.Podman.CompactMinReclaimGB != 12 {
 		t.Errorf("Podman.CompactMinReclaimGB should be 12 per config, got %d", cfg.Podman.CompactMinReclaimGB)

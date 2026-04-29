@@ -6,6 +6,13 @@ trimmed byte counts inside the VM, but that does not prove the host raw image
 released APFS allocation. The daemon therefore does not count `applehv` guest
 `fstrim` output as host bytes freed.
 
+Critical cleanup first handles the online path when a running buildx BuildKit
+container is visible. The daemon inspects `buildctl du`, prunes only when the
+reported reclaimable cache is above the configured floor, keeps recent cache and
+a storage floor, then runs advisory `fstrim`. The BuildKit command total is
+reported as `command_bytes_freed`; host reclaim is reported only from the
+measured host free-space delta after the trim.
+
 ## Review
 
 Use dry-run JSON before enabling offline compaction:
@@ -17,6 +24,9 @@ tinyland-cleanup --once --dry-run --level critical --output json
 The Podman plan reports:
 
 - provider and running state;
+- BuildKit builder cache container, reclaimable bytes, retention policy, and
+  protected skip reason when the cache is below threshold or cannot be
+  inspected;
 - disk format and disk path;
 - scratch directory, temp image path, and rollback backup path;
 - logical image size and physical host allocation;
@@ -34,6 +44,20 @@ can run. Blocked compaction still reports the potential reclaim in
 operator review.
 
 ## Enable
+
+BuildKit cache pruning is enabled by default only for critical Podman cleanup:
+
+```yaml
+podman:
+  buildkit_prune: true
+  buildkit_prune_keep_duration: 24h
+  buildkit_prune_keep_storage_mb: 8192
+  buildkit_prune_min_reclaim_gb: 4
+```
+
+This does not stop the Podman VM or delete the builder volume wholesale. It is
+still warm-cache cleanup: active builds may lose reusable cache, so the daemon
+keeps the newest records and a configured storage floor.
 
 Offline compaction is opt-in because it stops the Podman machine:
 

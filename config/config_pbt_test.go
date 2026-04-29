@@ -183,6 +183,18 @@ func TestPodmanConfigDefaults(t *testing.T) {
 	if cfg.Podman.PruneImagesAge == "" {
 		t.Error("Podman.PruneImagesAge should have a default")
 	}
+	if !cfg.Podman.BuildKitPrune {
+		t.Error("Podman.BuildKitPrune should default to true")
+	}
+	if cfg.Podman.BuildKitPruneKeepDuration == "" {
+		t.Error("Podman.BuildKitPruneKeepDuration should have a default")
+	}
+	if cfg.Podman.BuildKitPruneKeepStorageMB <= 0 {
+		t.Errorf("Podman.BuildKitPruneKeepStorageMB should be positive: %d", cfg.Podman.BuildKitPruneKeepStorageMB)
+	}
+	if cfg.Podman.BuildKitPruneMinReclaimGB < 0 {
+		t.Errorf("Podman.BuildKitPruneMinReclaimGB should be non-negative: %d", cfg.Podman.BuildKitPruneMinReclaimGB)
+	}
 
 	// MachineNames should have at least one entry on Darwin
 	// (but we can't check runtime.GOOS in test, so just verify it's set)
