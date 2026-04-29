@@ -224,6 +224,8 @@ type NixConfig struct {
 	MinUserGenerations int `yaml:"min_user_generations"`
 	// MinSystemGenerations preserves at least this many system/darwin generations when visible.
 	MinSystemGenerations int `yaml:"min_system_generations"`
+	// HostMeasurePath is the filesystem path used for plugin-isolated host free-space deltas.
+	HostMeasurePath string `yaml:"host_measure_path"`
 	// DeleteGenerationsOlderThan is the normal generation age policy.
 	DeleteGenerationsOlderThan string `yaml:"delete_generations_older_than"`
 	// CriticalDeleteGenerationsOlderThan is the critical-level generation age policy.
@@ -435,6 +437,7 @@ func DefaultConfig() *Config {
 		Nix: NixConfig{
 			MinUserGenerations:                 5,
 			MinSystemGenerations:               3,
+			HostMeasurePath:                    "/nix/store",
 			DeleteGenerationsOlderThan:         "14d",
 			CriticalDeleteGenerationsOlderThan: "3d",
 			AllowStoreOptimize:                 false,

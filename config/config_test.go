@@ -287,6 +287,9 @@ func TestNixPolicyDefaults(t *testing.T) {
 	if cfg.Nix.MinSystemGenerations != 3 {
 		t.Errorf("Nix.MinSystemGenerations should be 3, got %d", cfg.Nix.MinSystemGenerations)
 	}
+	if cfg.Nix.HostMeasurePath != "/nix/store" {
+		t.Errorf("Nix.HostMeasurePath should be /nix/store, got %q", cfg.Nix.HostMeasurePath)
+	}
 	if cfg.Nix.DeleteGenerationsOlderThan != "14d" {
 		t.Errorf("Nix.DeleteGenerationsOlderThan should be 14d, got %q", cfg.Nix.DeleteGenerationsOlderThan)
 	}
@@ -465,6 +468,7 @@ podman:
 nix:
   min_user_generations: 7
   min_system_generations: 4
+  host_measure_path: /nix
   delete_generations_older_than: 21d
   critical_delete_generations_older_than: 5d
   allow_store_optimize: true
@@ -616,6 +620,9 @@ darwin_dev_caches:
 	}
 	if cfg.Nix.MinSystemGenerations != 4 {
 		t.Errorf("Nix.MinSystemGenerations should be 4 per config, got %d", cfg.Nix.MinSystemGenerations)
+	}
+	if cfg.Nix.HostMeasurePath != "/nix" {
+		t.Errorf("Nix.HostMeasurePath should be /nix per config, got %q", cfg.Nix.HostMeasurePath)
 	}
 	if cfg.Nix.DeleteGenerationsOlderThan != "21d" {
 		t.Errorf("Nix.DeleteGenerationsOlderThan should be 21d per config, got %q", cfg.Nix.DeleteGenerationsOlderThan)

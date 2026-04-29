@@ -19,7 +19,9 @@ import (
 const nixDefaultCommandTimeout = 20 * time.Minute
 
 // NixPlugin handles Nix garbage collection operations.
-type NixPlugin struct{}
+type NixPlugin struct {
+	freeDiskSpace func(string) (uint64, error)
+}
 
 type nixGeneration struct {
 	Number    int
@@ -38,7 +40,7 @@ type nixGCRoot struct {
 
 // NewNixPlugin creates a new Nix cleanup plugin.
 func NewNixPlugin() *NixPlugin {
-	return &NixPlugin{}
+	return &NixPlugin{freeDiskSpace: getFreeDiskSpace}
 }
 
 // Name returns the plugin identifier.
@@ -79,6 +81,7 @@ func (p *NixPlugin) PlanCleanup(ctx context.Context, level CleanupLevel, cfg *co
 			"skip_when_daemon_busy":                     strconv.FormatBool(cfg.Nix.SkipWhenDaemonBusy),
 			"daemon_busy_backoff":                       cfg.Nix.DaemonBusyBackoff,
 			"max_gc_duration":                           cfg.Nix.MaxGCDuration,
+			"host_measure_path":                         nixHostMeasurePath(cfg.Nix),
 			"root_attribution_limit":                    strconv.Itoa(nixRootAttributionLimit(cfg.Nix)),
 			"generation_policy_delete_older_than_level": nixGenerationPolicyAge(level, cfg.Nix),
 		},
@@ -233,12 +236,14 @@ func (p *NixPlugin) Cleanup(ctx context.Context, level CleanupLevel, cfg *config
 		gcResult := p.collectGarbage(ctx, level, nil, cfg.Nix, logger)
 		result.BytesFreed += gcResult.BytesFreed
 		result.CommandBytesFreed += gcResult.CommandBytesFreed
+		result.HostBytesFreed += gcResult.HostBytesFreed
 		result.ItemsCleaned += gcResult.ItemsCleaned
 		result.Error = gcResult.Error
 	case LevelCritical:
 		gcResult := p.collectGarbageCritical(ctx, cfg.Nix, logger)
 		result.BytesFreed += gcResult.BytesFreed
 		result.CommandBytesFreed += gcResult.CommandBytesFreed
+		result.HostBytesFreed += gcResult.HostBytesFreed
 		result.ItemsCleaned += gcResult.ItemsCleaned
 		result.Error = gcResult.Error
 	}
@@ -309,6 +314,8 @@ func (p *NixPlugin) collectGarbage(ctx context.Context, level CleanupLevel, args
 	result := CleanupResult{Plugin: p.Name(), Level: level}
 
 	logger.Debug("running nix-collect-garbage", "args", strings.Join(args, " "))
+	measurePath := nixHostMeasurePath(cfg)
+	before, beforeOK := p.measureFreeDiskSpace(measurePath, logger)
 
 	ctx, cancel := context.WithTimeout(ctx, nixCommandTimeout(cfg))
 	defer cancel()
@@ -327,8 +334,51 @@ func (p *NixPlugin) collectGarbage(ctx context.Context, level CleanupLevel, args
 	result.CommandBytesFreed = p.parseFreedSpace(string(output))
 	result.BytesFreed = result.CommandBytesFreed
 	result.ItemsCleaned = p.parseDeletedPaths(string(output))
+	if beforeOK {
+		result.HostBytesFreed = p.measuredHostDelta(before, measurePath, logger)
+	}
 
 	return result
+}
+
+func nixHostMeasurePath(cfg config.NixConfig) string {
+	path := strings.TrimSpace(cfg.HostMeasurePath)
+	if path == "" {
+		path = "/nix/store"
+	}
+	home, _ := os.UserHomeDir()
+	path = filepath.Clean(expandHome(path, home))
+	if pathExists(path) {
+		return path
+	}
+	if pathExists("/nix") {
+		return "/nix"
+	}
+	if home != "" && pathExists(home) {
+		return home
+	}
+	return "."
+}
+
+func (p *NixPlugin) measureFreeDiskSpace(path string, logger *slog.Logger) (int64, bool) {
+	freeDiskSpace := p.freeDiskSpace
+	if freeDiskSpace == nil {
+		freeDiskSpace = getFreeDiskSpace
+	}
+	free, err := freeDiskSpace(path)
+	if err != nil {
+		logger.Debug("Nix host free-space measurement failed", "path", path, "error", err)
+		return 0, false
+	}
+	return int64FromUint64(free), true
+}
+
+func (p *NixPlugin) measuredHostDelta(before int64, path string, logger *slog.Logger) int64 {
+	after, ok := p.measureFreeDiskSpace(path, logger)
+	if !ok || after <= before {
+		return 0
+	}
+	return after - before
 }
 
 func (p *NixPlugin) collectGarbageCritical(ctx context.Context, cfg config.NixConfig, logger *slog.Logger) CleanupResult {
@@ -338,6 +388,7 @@ func (p *NixPlugin) collectGarbageCritical(ctx context.Context, cfg config.NixCo
 	gcResult := p.collectGarbage(ctx, LevelCritical, nil, cfg, logger)
 	result.BytesFreed = gcResult.BytesFreed
 	result.CommandBytesFreed = gcResult.CommandBytesFreed
+	result.HostBytesFreed = gcResult.HostBytesFreed
 	result.ItemsCleaned = gcResult.ItemsCleaned
 	if gcResult.Error != nil {
 		result.Error = gcResult.Error
@@ -350,6 +401,8 @@ func (p *NixPlugin) collectGarbageCritical(ctx context.Context, cfg config.NixCo
 	}
 
 	logger.Warn("CRITICAL: running nix-store --optimize")
+	measurePath := nixHostMeasurePath(cfg)
+	before, beforeOK := p.measureFreeDiskSpace(measurePath, logger)
 	optimizeCtx, cancel := context.WithTimeout(ctx, nixCommandTimeout(cfg))
 	defer cancel()
 
@@ -363,6 +416,9 @@ func (p *NixPlugin) collectGarbageCritical(ctx context.Context, cfg config.NixCo
 	optimizedBytes := p.parseOptimizedSpace(string(output))
 	result.BytesFreed += optimizedBytes
 	result.CommandBytesFreed += optimizedBytes
+	if beforeOK {
+		result.HostBytesFreed += p.measuredHostDelta(before, measurePath, logger)
+	}
 
 	return result
 }
@@ -634,7 +690,7 @@ func nixPlanSteps(level CleanupLevel, cfg config.NixConfig) []string {
 		}
 	}
 
-	steps = append(steps, "Use cleanup-cycle host free-space accounting for before/after disk deltas")
+	steps = append(steps, "Measure the Nix store filesystem before and after real GC for plugin-isolated host byte deltas")
 	return steps
 }
 
