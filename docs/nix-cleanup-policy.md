@@ -22,6 +22,8 @@ The Nix plan includes:
   distinguish a temporary deferral from a cleanup-policy mismatch;
 - `nix_daemon_contention` deferral when dry-run GC itself reports SQLite or
   store lock contention and `skip_when_daemon_busy` is enabled;
+- `host_measure_path`, the filesystem path used to measure plugin-isolated
+  host free-space deltas around real Nix GC and optional store optimization;
 - visible GC roots when dry-run GC reports no reclaimable store space;
 - generation targets with `keep_generation`, `delete_generation`, or
   `review_privileged_generation` actions;
@@ -37,6 +39,7 @@ Default policy:
 nix:
   min_user_generations: 5
   min_system_generations: 3
+  host_measure_path: /nix/store
   delete_generations_older_than: 14d
   critical_delete_generations_older_than: 3d
   allow_store_optimize: false
@@ -61,6 +64,9 @@ Runtime behavior:
 - real generation deletion and GC commands also treat those contention
   signatures as deferred no-op cleanup steps when `skip_when_daemon_busy` is
   enabled;
+- real GC reports Nix command output in `command_bytes_freed` and separately
+  reports measured filesystem free-space growth from `host_measure_path` in
+  `host_bytes_freed`;
 - real cleanup runs a dry-run GC preflight before mutation and skips the actual
   GC command when the preflight reports zero reclaimable store paths and no
   user generation deletion happened in the same cycle;
@@ -93,6 +99,7 @@ Recommended Rocky or Linux runner defaults:
 nix:
   min_user_generations: 3
   min_system_generations: 2
+  host_measure_path: /nix/store
   delete_generations_older_than: 7d
   critical_delete_generations_older_than: 2d
   allow_store_optimize: false

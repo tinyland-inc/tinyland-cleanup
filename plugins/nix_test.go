@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -120,6 +121,88 @@ exit 0
 	}
 	if got, want := string(calls), "--dry-run\n"; got != want {
 		t.Fatalf("unexpected nix-collect-garbage calls %q, want %q", got, want)
+	}
+}
+
+func TestNixCollectGarbageReportsHostDeltaSeparately(t *testing.T) {
+	binDir := t.TempDir()
+	fakeGC := filepath.Join(binDir, "nix-collect-garbage")
+	script := `#!/bin/sh
+printf '%s\n' "would delete 1 store paths"
+printf '%s\n' "16.0 MiB freed"
+`
+	if err := os.WriteFile(fakeGC, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := config.DefaultConfig().Nix
+	cfg.HostMeasurePath = t.TempDir()
+	p := NewNixPlugin()
+	freeValues := []uint64{1000, 1256}
+	p.freeDiskSpace = func(path string) (uint64, error) {
+		if path != cfg.HostMeasurePath {
+			t.Fatalf("expected measure path %q, got %q", cfg.HostMeasurePath, path)
+		}
+		if len(freeValues) == 0 {
+			t.Fatal("free space measured more times than expected")
+		}
+		value := freeValues[0]
+		freeValues = freeValues[1:]
+		return value, nil
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	result := p.collectGarbage(context.Background(), LevelWarning, nil, cfg, logger)
+	if result.Error != nil {
+		t.Fatalf("collectGarbage returned error: %v", result.Error)
+	}
+	if result.CommandBytesFreed != 16*1024*1024 || result.BytesFreed != result.CommandBytesFreed {
+		t.Fatalf("command bytes should remain separate command evidence: %+v", result)
+	}
+	if result.HostBytesFreed != 256 {
+		t.Fatalf("expected measured host delta 256, got %+v", result)
+	}
+}
+
+func TestNixCollectGarbageSkipsHostDeltaWhenMeasurementFails(t *testing.T) {
+	binDir := t.TempDir()
+	fakeGC := filepath.Join(binDir, "nix-collect-garbage")
+	if err := os.WriteFile(fakeGC, []byte("#!/bin/sh\nprintf '%s\\n' '8.0 MiB freed'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := config.DefaultConfig().Nix
+	cfg.HostMeasurePath = t.TempDir()
+	p := NewNixPlugin()
+	p.freeDiskSpace = func(string) (uint64, error) {
+		return 0, errors.New("measurement unavailable")
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	result := p.collectGarbage(context.Background(), LevelWarning, nil, cfg, logger)
+	if result.Error != nil {
+		t.Fatalf("collectGarbage returned error: %v", result.Error)
+	}
+	if result.CommandBytesFreed != 8*1024*1024 {
+		t.Fatalf("expected command bytes from Nix output, got %+v", result)
+	}
+	if result.HostBytesFreed != 0 {
+		t.Fatalf("failed measurement should not invent host bytes: %+v", result)
+	}
+}
+
+func TestNixHostMeasurePathDefaultsAndFallbacks(t *testing.T) {
+	cfg := config.NixConfig{}
+	if got := nixHostMeasurePath(cfg); got == "" {
+		t.Fatal("expected non-empty default host measure path")
+	}
+
+	measurePath := t.TempDir()
+	cfg.HostMeasurePath = measurePath
+	if got := nixHostMeasurePath(cfg); got != measurePath {
+		t.Fatalf("expected configured measure path %q, got %q", measurePath, got)
 	}
 }
 

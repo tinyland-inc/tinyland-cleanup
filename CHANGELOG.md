@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
   Playwright, Bazelisk, and pip.
 - Nix cleanup preflight plans with dry-run reclaim estimates, generation
   retention targets, daemon-contention detection, and opt-in store optimization.
+- Nix real-cleanup host free-space delta accounting around GC and optional store
+  optimization, separate from command-reported reclaimed bytes.
 - Bazel cache and output-base dry-run planning with active-use detection,
   protected workspace symlink detection, and budget metadata.
 - Top-level dry-run summary fields for planned estimated reclaim, required free

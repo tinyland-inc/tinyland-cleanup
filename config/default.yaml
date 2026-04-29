@@ -112,6 +112,8 @@ nix:
   # Preserve rollback safety even under disk pressure
   min_user_generations: 5
   min_system_generations: 3
+  # Filesystem used for plugin-isolated host free-space deltas around real Nix GC.
+  host_measure_path: /nix/store
 
   # User generation deletion policy for moderate/aggressive and critical levels
   delete_generations_older_than: 14d
